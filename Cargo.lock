@@ -309,6 +309,7 @@ dependencies = [
  "anyhow",
  "clap",
  "commx-core",
+ "directories",
  "libc",
  "ratatui",
  "serde_json",
@@ -344,6 +345,7 @@ name = "commxd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "commx-core",
  "hex",

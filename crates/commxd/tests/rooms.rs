@@ -330,3 +330,54 @@ fn tor_room_over_onion_services() {
     let reason = b.expect_nuked(&room, 90);
     eprintln!("member nuked: {reason}");
 }
+
+#[test]
+fn file_shared_through_host_then_nuked_off_disk() {
+    let (mut a, mut b, mut c) = (Node::spawn("f-a"), Node::spawn("f-b"), Node::spawn("f-c"));
+    a.alias("alice");
+    b.alias("bob");
+    c.alias("carol");
+    let (room, code) = a.room("files", "HostOnly", 15, false);
+    b.join(&code);
+    let code = a.invite(&room);
+    c.join(&code);
+
+    // 5 MiB + change of non-repeating bytes, so a plaintext scan is meaningful.
+    let mut data = Vec::with_capacity(5 * 1024 * 1024 + 777);
+    let mut x: u64 = 0x9e3779b97f4a7c15;
+    while data.len() < 5 * 1024 * 1024 + 777 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        data.extend_from_slice(&x.to_le_bytes());
+    }
+    let src = b.dir.join("report.bin");
+    std::fs::write(&src, &data).unwrap();
+
+    b.req(json!({"op": "send_file", "room_id": room, "path": src.to_str().unwrap()}));
+    a.expect_system("is sharing #1 'report.bin'");
+    c.expect_system("#1 'report.bin' ready");
+    a.expect_system("#1 'report.bin' ready");
+    b.expect_system("📎 #1 sent");
+
+    // At rest: only random-named, padded ciphertext blobs.
+    let blobs: Vec<_> = std::fs::read_dir(c.dir.join("blobs")).unwrap().flatten().map(|e| e.path()).collect();
+    assert_eq!(blobs.len(), 1);
+    let on_disk = std::fs::read(&blobs[0]).unwrap();
+    assert!(on_disk.len() > data.len(), "padded");
+    assert!(!on_disk.windows(32).step_by(7).any(|w| w == &data[4096..4128]), "plaintext on disk");
+
+    let out = c.dir.join("export");
+    std::fs::create_dir_all(&out).unwrap();
+    c.req(json!({"op": "save_file", "room_id": room, "no": 1, "dest": out.to_str().unwrap()}));
+    c.expect("save ok", 20, |v| v["ev"] == "ok" && v["msg"].as_str().unwrap().starts_with("saved #1"));
+    assert_eq!(std::fs::read(out.join("report.bin")).unwrap(), data);
+
+    a.req(json!({"op": "nuke", "room_id": room}));
+    c.expect_nuked(&room, 10);
+    std::thread::sleep(Duration::from_millis(300));
+    for n in [&a, &c] {
+        let left = std::fs::read_dir(n.dir.join("blobs")).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(left, 0, "blobs survived the nuke");
+    }
+}

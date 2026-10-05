@@ -5,6 +5,7 @@
 #[global_allocator]
 static ALLOC: commx_core::secmem::ZeroizingAlloc = commx_core::secmem::ZeroizingAlloc;
 
+mod files;
 mod ipc_server;
 mod killswitch;
 mod net;
@@ -101,6 +102,7 @@ async fn main() -> Result<()> {
         private_dir(parent)?;
     }
     let ipc = bind_socket(&sock_path)?;
+    files::purge_orphans(&data_dir);
 
     // In Tor mode only tor itself may reach us, so listen on loopback.
     let listen = if args.tor { "127.0.0.1:0".to_string() } else { args.listen.clone() };

@@ -7,7 +7,10 @@ use commx_core::wire::{nuke_bytes, verify_nuke, WireMsg};
 use commx_core::{room_id_hex, RoomId};
 use std::time::{Duration, Instant};
 
-use crate::state::{Daemon, PeerKind, Role};
+use crate::files::FileState;
+use crate::state::{Daemon, Followup, PeerKind, Role};
+
+const FILE_STALL: Duration = Duration::from_secs(90);
 
 enum After {
     Nothing,
@@ -17,10 +20,13 @@ enum After {
 
 impl Daemon {
     /// A message arrived on one of a room's connections.
-    pub fn on_wire(&mut self, room_id: RoomId, kind: PeerKind, msg: WireMsg) {
+    pub fn on_wire(&mut self, room_id: RoomId, kind: PeerKind, msg: WireMsg) -> Followup {
         let ev = self.events.clone();
-        let Some(room) = self.rooms.get_mut(&room_id) else { return };
+        let Some(room) = self.rooms.get_mut(&room_id) else { return Followup::default() };
         room.touch(kind);
+        if matches!(msg, WireMsg::FileChunk { .. }) {
+            return room.on_chunk(kind, msg);
+        }
         let after = match (kind, msg) {
             (PeerKind::Member(pk), WireMsg::Submit(p)) => {
                 if room.allow_submit(&pk) {
@@ -47,6 +53,27 @@ impl Daemon {
             After::Gone(why) => self.peer_gone(room_id, kind, why),
             After::Nuke(reason, tell) => self.nuke(&room_id, &reason, tell),
         }
+        Followup::default()
+    }
+
+    /// Background hash check of a received file finished.
+    pub fn file_verified(&mut self, room_id: RoomId, file_id: [u8; 16], res: anyhow::Result<()>) {
+        let ev = self.events.clone();
+        let Some(room) = self.rooms.get_mut(&room_id) else { return };
+        let Some(e) = room.files.get_mut(&file_id) else { return };
+        let (no, name) = (e.no, e.name.clone());
+        let line = match res {
+            Ok(()) => {
+                e.state = FileState::Ready;
+                format!("📎 #{no} '{name}' ready — /save {no} [path]")
+            }
+            Err(err) => {
+                e.state = FileState::Failed(err.to_string());
+                e.blob = None;
+                format!("📎 #{no} '{name}' failed verification: {err}")
+            }
+        };
+        room.system(&ev, line);
     }
 
     /// A connection died or went silent past the grace window.
@@ -167,6 +194,20 @@ impl Daemon {
         }
         for (id, kind, why) in gone {
             self.peer_gone(id, kind, why);
+        }
+
+        let ev = self.events.clone();
+        for room in self.rooms.values_mut() {
+            let stalled: Vec<[u8; 16]> =
+                room.files.values().filter(|f| f.stalled(FILE_STALL)).map(|f| f.id).collect();
+            for id in stalled {
+                if let Some(f) = room.files.get_mut(&id) {
+                    f.state = FileState::Failed("transfer stalled".into());
+                    f.blob = None;
+                    let line = format!("📎 #{} '{}' failed: transfer stalled", f.no, f.name);
+                    room.system(&ev, line);
+                }
+            }
         }
 
         self.invites.retain(|_, i| i.expires > now);

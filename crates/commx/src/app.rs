@@ -9,7 +9,31 @@ const HISTORY: usize = 500;
 
 use crate::commands::{self, Command};
 
-/// Author tag for lines only this client shows (invite codes).
+fn human_size(n: u64) -> String {
+    match n {
+        n if n >= 1 << 20 => format!("{:.1} MiB", n as f64 / (1u64 << 20) as f64),
+        n if n >= 1 << 10 => format!("{:.1} KiB", n as f64 / 1024.0),
+        n => format!("{n} B"),
+    }
+}
+
+/// `~/x` → absolute path; the daemon doesn't know about `~`.
+fn expand_path(p: &str) -> String {
+    let home = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf());
+    match (p.strip_prefix("~/").or(if p == "~" { Some("") } else { None }), home) {
+        (Some(rest), Some(h)) => h.join(rest).to_string_lossy().into_owned(),
+        _ => std::path::absolute(p).map(|a| a.to_string_lossy().into_owned()).unwrap_or_else(|_| p.to_string()),
+    }
+}
+
+fn default_download_dir() -> String {
+    directories::UserDirs::new()
+        .and_then(|u| u.download_dir().map(|d| d.to_path_buf()).or_else(|| Some(u.home_dir().to_path_buf())))
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".into())
+}
+
+/// Author tag for lines only this client shows (invite codes, file lists).
 pub const LOCAL: &str = "~";
 
 pub enum Secret {
@@ -189,6 +213,15 @@ impl App {
                     log.push(l);
                 }
             }
+            IpcEvent::Files { room_id, list } => {
+                if list.is_empty() {
+                    self.local_line(&room_id, "no files in this room".into());
+                }
+                for f in list {
+                    let line = format!("#{} {} · {} · from {} · {}", f.no, f.name, human_size(f.size), f.from, f.state);
+                    self.local_line(&room_id, line);
+                }
+            }
             IpcEvent::Nuked { room_id, name, reason } => {
                 let cur = self.current().map(|r| r.room_id.clone());
                 self.rooms.retain(|r| r.room_id != room_id);
@@ -276,6 +309,21 @@ impl App {
             }
             Command::Invite => match room {
                 Some(room_id) => vec![IpcRequest::Invite { room_id }],
+                None => need_room(self),
+            },
+            Command::SendFile(path) => match room {
+                Some(room_id) => vec![IpcRequest::SendFile { room_id, path: expand_path(&path) }],
+                None => need_room(self),
+            },
+            Command::Files => match room {
+                Some(room_id) => vec![IpcRequest::Files { room_id }],
+                None => need_room(self),
+            },
+            Command::Save { no, dest } => match room {
+                Some(room_id) => {
+                    let dest = dest.map(|d| expand_path(&d)).unwrap_or_else(default_download_dir);
+                    vec![IpcRequest::SaveFile { room_id, no, dest }]
+                }
                 None => need_room(self),
             },
             Command::Nuke { all: true } => vec![IpcRequest::Nuke { room_id: None }],

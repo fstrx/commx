@@ -14,6 +14,9 @@ pub enum Command {
     Invite,
     Join(String),
     Nuke { all: bool },
+    SendFile(String),
+    Files,
+    Save { no: u32, dest: Option<String> },
     Status,
     Quit,
     Say(String),
@@ -29,6 +32,9 @@ pub const HELP: &[&str] = &[
     "/dm <label>                       host a 2-person DM (any drop nukes it)",
     "/invite                           fresh single-use invite for this room (host only)",
     "/join <cx1:...>                   join from an invite code",
+    "/send <path>                      share a file with this room (max 256 MiB)",
+    "/files                            list this room's files",
+    "/save <n> [path]                  export file #n decrypted (default: Downloads)",
     "/nuke                             destroy this room (host: for everyone)",
     "/nuke all                         destroy everything, now",
     "/status   /help   /quit",
@@ -85,6 +91,14 @@ pub fn parse(input: &str) -> Result<Command, String> {
         ("/invite", _) => Ok(Command::Invite),
         ("/join", [code]) => Ok(Command::Join(code.to_string())),
         ("/join", _) => usage("/join <cx1:...>"),
+        ("/send", path) if !path.is_empty() => Ok(Command::SendFile(path.join(" "))),
+        ("/send", _) => usage("/send <path>"),
+        ("/files", _) => Ok(Command::Files),
+        ("/save", [no, dest @ ..]) => {
+            let no = no.trim_start_matches('#').parse().map_err(|_| "file number expected".to_string())?;
+            Ok(Command::Save { no, dest: (!dest.is_empty()).then(|| dest.join(" ")) })
+        }
+        ("/save", _) => usage("/save <n> [path]"),
         ("/nuke", []) => Ok(Command::Nuke { all: false }),
         ("/nuke", ["all"]) => Ok(Command::Nuke { all: true }),
         ("/nuke", _) => usage("/nuke [all]"),
@@ -108,6 +122,9 @@ mod tests {
             Command::AliasNew { name: "ghost".into(), ephemeral: true }
         );
         assert_eq!(parse("/nuke all").unwrap(), Command::Nuke { all: true });
+        assert_eq!(parse("/send ~/My Docs/a.pdf").unwrap(), Command::SendFile("~/My Docs/a.pdf".into()));
+        assert_eq!(parse("/save #3").unwrap(), Command::Save { no: 3, dest: None });
+        assert_eq!(parse("/save 2 /tmp/x").unwrap(), Command::Save { no: 2, dest: Some("/tmp/x".into()) });
         assert!(parse("/room new").is_err());
         assert!(parse("/grace --x").is_err());
     }

@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
+use crate::files::FileState;
 use crate::net;
 use crate::state::{lock, Shared};
 use crate::transport::Net;
@@ -176,6 +177,45 @@ async fn handle(
                 return Err(anyhow!("no such room"));
             }
             d.nuke(&id, "nuked by you", true);
+        }
+        IpcRequest::SendFile { room_id, path } => {
+            let id = room_arg(&room_id)?;
+            let path = std::path::PathBuf::from(path);
+            if !path.is_file() {
+                return Err(anyhow!("not a file: {}", path.display()));
+            }
+            ok(tx, format!("sending {}…", path.display()));
+            let (shared, tx) = (shared.clone(), tx.clone());
+            // Big files take a while; don't block this client's other requests.
+            tokio::spawn(async move {
+                if let Err(e) = net::send_file(shared, id, path).await {
+                    let _ = tx.send(IpcEvent::Error { msg: format!("send failed: {e}") });
+                }
+            });
+        }
+        IpcRequest::Files { room_id } => {
+            let id = room_arg(&room_id)?;
+            let list = lock(shared).rooms.get(&id).ok_or_else(|| anyhow!("no such room"))?.file_list();
+            let _ = tx.send(IpcEvent::Files { room_id, list });
+        }
+        IpcRequest::SaveFile { room_id, no, dest } => {
+            let id = room_arg(&room_id)?;
+            let (reader, name) = {
+                let d = lock(shared);
+                let room = d.rooms.get(&id).ok_or_else(|| anyhow!("no such room"))?;
+                let e = room.files.values().find(|e| e.no == no).ok_or_else(|| anyhow!("no file #{no}"))?;
+                if !matches!(e.state, FileState::Ready) {
+                    return Err(anyhow!("file #{no} isn't ready ({})", e.info().state));
+                }
+                (e.reader().ok_or_else(|| anyhow!("file #{no} has no local copy"))?, e.name.clone())
+            };
+            let mut dest = std::path::PathBuf::from(dest);
+            if dest.is_dir() {
+                dest = dest.join(&name);
+            }
+            let out = dest.clone();
+            tokio::task::spawn_blocking(move || reader.export(&out)).await??;
+            ok(tx, format!("saved #{no} to {} (decrypted copy — commx can't nuke it)", dest.display()));
         }
         IpcRequest::Nuke { room_id: None } => {
             lock(shared).nuke_all("nuked by you");

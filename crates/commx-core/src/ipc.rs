@@ -20,6 +20,10 @@ pub enum IpcRequest {
     History { room_id: String },
     /// `None` nukes everything.
     Nuke { room_id: Option<String> },
+    SendFile { room_id: String, path: String },
+    Files { room_id: String },
+    /// Export a decrypted copy of file `no` to `dest` (never overwrites).
+    SaveFile { room_id: String, no: u32, dest: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +37,16 @@ pub struct RoomSummary {
     pub alias: String,
     pub host_fp: String,
     pub members: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileInfo {
+    pub no: u32,
+    pub name: String,
+    pub size: u64,
+    pub from: String,
+    /// "sending", "receiving 40%", "ready", "sent", "failed: ..."
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,4 +86,5 @@ pub enum IpcEvent {
     Line { room_id: String, line: ChatLine },
     History { room_id: String, lines: Vec<ChatLine> },
     Nuked { room_id: String, name: String, reason: String },
+    Files { room_id: String, list: Vec<FileInfo> },
 }

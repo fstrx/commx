@@ -38,6 +38,9 @@ pub enum WireMsg {
     /// Host → members: a sequenced, signed block.
     Block(Block),
     Heartbeat,
+    /// Encrypted file chunk (bulk lane). Relayed by the host, never chained:
+    /// its file's signed announcement carries the hash that authenticates it.
+    FileChunk { room_id: RoomId, file_id: [u8; 16], idx: u32, nonce: [u8; 24], ct: Vec<u8> },
     /// Host → members: destroy this room now.
     Nuke { room_id: RoomId, sig: Vec<u8> },
     /// Member → host: I'm leaving.

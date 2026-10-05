@@ -21,12 +21,47 @@ pub enum Body {
     /// New room key, sealed to each remaining member's sign_pk/dh_pk.
     KeyRotate { new_epoch: u32, sealed: Vec<([u8; 32], Sealed)> },
     Join { member: MemberInfo },
+    /// File announcement: postcard `FileMeta` sealed under the room key of `epoch`.
+    File { file_id: [u8; 16], nonce: [u8; 24], ct: Vec<u8> },
     Leave { sign_pk: [u8; 32] },
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct ChatPlain {
     pub text: String,
+}
+
+/// Plaintext 32 KiB per file chunk.
+pub const FILE_CHUNK: usize = 32 * 1024;
+pub const MAX_FILE_SIZE: u64 = 256 * 1024 * 1024;
+
+/// What a room learns about a shared file. `key` encrypts its chunks and is
+/// only ever kept in RAM.
+#[derive(Clone, Serialize, Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+pub struct FileMeta {
+    pub name: String,
+    pub size: u64,
+    pub chunks: u32,
+    pub hash: [u8; 32],
+    pub key: [u8; 32],
+}
+
+impl FileMeta {
+    pub fn expected_chunks(size: u64) -> u32 {
+        size.div_ceil(FILE_CHUNK as u64).max(1) as u32
+    }
+
+    pub fn is_consistent(&self) -> bool {
+        self.size <= MAX_FILE_SIZE && self.chunks == Self::expected_chunks(self.size)
+    }
+}
+
+/// AAD for a file chunk: binds it to its file and position.
+pub fn chunk_aad(file_id: &[u8; 16], idx: u32) -> Vec<u8> {
+    let mut aad = b"commx-chunk".to_vec();
+    aad.extend_from_slice(file_id);
+    aad.extend_from_slice(&idx.to_be_bytes());
+    aad
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
