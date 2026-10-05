@@ -1,0 +1,15 @@
+# Install: cp dist/commxd.service ~/.config/systemd/user/ && systemctl --user enable --now commxd
+[Unit]
+Description=commx node daemon
+After=network-online.target
+
+[Service]
+ExecStart=%h/.cargo/bin/commxd --listen 0.0.0.0:4700
+Restart=on-failure
+StandardOutput=null
+StandardError=null
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

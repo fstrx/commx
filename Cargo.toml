@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["crates/commx-core", "crates/commxd", "crates/commx"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+commx-core = { path = "crates/commx-core" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
+rand = "0.8"
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+chacha20poly1305 = "0.10"
+blake3 = "1"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
+data-encoding = "2"
+hex = "0.4"
+snow = "=0.9.6"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+directories = "5"
+libc = "0.2"
+ratatui = "0.29"
+
+[profile.release]
+panic = "abort"
+strip = true
+lto = true
+
+# Crypto (argon2, chacha, dalek) is painfully slow unoptimized; keep deps fast in dev/test.
+[profile.dev.package."*"]
+opt-level = 2

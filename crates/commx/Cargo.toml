@@ -1,0 +1,14 @@
+[package]
+name = "commx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+commx-core.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap.workspace = true
+ratatui.workspace = true
+libc.workspace = true

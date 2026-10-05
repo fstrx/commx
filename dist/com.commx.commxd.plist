@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Edit the commxd path below (cargo install puts it in ~/.cargo/bin; launchd needs an absolute path). Install: cp dist/com.commx.commxd.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.commx.commxd.plist -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.commx.commxd</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/commxd</string>
+        <string>--listen</string>
+        <string>0.0.0.0:4700</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <!-- No log files: nothing commx does should leave traces on disk. -->
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+</dict>
+</plist>
