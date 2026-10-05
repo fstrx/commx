@@ -1,16 +1,18 @@
 //! Encrypted, authenticated node-to-node channels.
 //!
 //! Every connection runs a Noise XX handshake with this run's node key, then
-//! carries length-prefixed Noise transport messages. The stream type is boxed,
-//! so a Tor transport can hand in an onion-service stream later without
-//! touching anything above this module.
+//! carries length-prefixed Noise transport messages. Underneath is either a
+//! direct TCP stream or a Tor circuit; nothing above [`Net`] knows which.
 
-pub mod tcp;
+pub mod tor;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use commx_core::wire::{self, WireMsg};
-use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::OnceCell;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use zeroize::Zeroizing;
 
@@ -21,8 +23,152 @@ const TAG_LEN: usize = 16;
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Stream for T {}
 
-pub trait Transport: Send + Sync + 'static {
-    fn dial(&self, addr: &str) -> impl Future<Output = Result<Conn>> + Send;
+const TCP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Tor circuits are slow to build, and a brand-new onion takes a while to
+/// publish its descriptor, so keep retrying for this long.
+const TOR_DIAL_WINDOW: Duration = Duration::from_secs(180);
+const TOR_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+enum Mode {
+    Tcp { advertise: String },
+    Tor { tor: Box<OnceCell<tor::Tor>>, status: std::sync::Mutex<String> },
+}
+
+/// The daemon's network: dialing peers, accepting them, and giving each room
+/// an address to put in invites.
+pub struct Net {
+    key: NodeKey,
+    /// Loopback/LAN port our TCP listener is bound to.
+    local_port: u16,
+    mode: Mode,
+}
+
+impl Net {
+    pub fn tcp(key: NodeKey, local_port: u16, advertise: String) -> Self {
+        Self { key, local_port, mode: Mode::Tcp { advertise } }
+    }
+
+    pub fn tor(key: NodeKey, local_port: u16) -> Self {
+        let mode = Mode::Tor { tor: Box::default(), status: std::sync::Mutex::new("tor starting".into()) };
+        Self { key, local_port, mode }
+    }
+
+    pub fn is_tor(&self) -> bool {
+        matches!(self.mode, Mode::Tor { .. })
+    }
+
+    /// Launch tor in the background and track bootstrap progress.
+    pub fn start_tor(self: &Arc<Self>, bin: String, dir: PathBuf) {
+        let net = self.clone();
+        tokio::spawn(async move {
+            let Mode::Tor { tor, status } = &net.mode else { return };
+            let set = |s: String| *status.lock().unwrap_or_else(|e| e.into_inner()) = s;
+            let t = match tor::Tor::launch(&bin, &dir).await {
+                Ok(t) => t,
+                Err(e) => return set(format!("tor failed: {e}")),
+            };
+            loop {
+                match t.bootstrap_progress().await {
+                    Ok(100) => break,
+                    Ok(p) => set(format!("tor bootstrapping {p}%")),
+                    Err(e) => return set(format!("tor failed: {e}")),
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            let _ = tor.set(t);
+            set("tor ready".into());
+        });
+    }
+
+    fn tor_ready(&self) -> Result<&tor::Tor> {
+        match &self.mode {
+            Mode::Tor { tor, status } => tor
+                .get()
+                .ok_or_else(|| anyhow!("not ready yet: {}", status.lock().unwrap_or_else(|e| e.into_inner()))),
+            Mode::Tcp { .. } => bail!("tor is off (start commxd with --tor)"),
+        }
+    }
+
+    /// Short description for the status bar.
+    pub fn label(&self) -> String {
+        match &self.mode {
+            Mode::Tcp { advertise } => format!("tcp {advertise}"),
+            Mode::Tor { status, .. } => status.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        }
+    }
+
+    /// Address for a new room's invites, plus the onion id to release on nuke.
+    pub async fn room_endpoint(&self) -> Result<(String, Option<String>)> {
+        match &self.mode {
+            Mode::Tcp { advertise } => Ok((advertise.clone(), None)),
+            Mode::Tor { .. } => {
+                let id = self.tor_ready()?.add_onion(self.local_port).await?;
+                Ok((format!("{id}.onion:{}", tor::ONION_PORT), Some(id)))
+            }
+        }
+    }
+
+    /// Take a room's onion service down (fire and forget).
+    pub fn release(self: &Arc<Self>, onion_id: String) {
+        let net = self.clone();
+        tokio::spawn(async move {
+            if let Ok(t) = net.tor_ready() {
+                let _ = t.del_onion(&onion_id).await;
+            }
+        });
+    }
+
+    pub async fn dial(&self, addr: &str) -> Result<Conn> {
+        let (host, port) = addr.rsplit_once(':').ok_or_else(|| anyhow!("address needs host:port"))?;
+        let port: u16 = port.parse().context("bad port")?;
+        let onion = host.ends_with(".onion");
+        match &self.mode {
+            Mode::Tcp { .. } => {
+                if onion {
+                    bail!("that invite is an onion address; start commxd with --tor");
+                }
+                let stream = tokio::time::timeout(TCP_TIMEOUT, TcpStream::connect(addr))
+                    .await
+                    .context("connect timed out")?
+                    .with_context(|| format!("can't reach {addr}"))?;
+                stream.set_nodelay(true)?;
+                tokio::time::timeout(TCP_TIMEOUT, handshake(Box::new(stream), &self.key, true))
+                    .await
+                    .context("handshake timed out")?
+            }
+            Mode::Tor { .. } => {
+                // Never leak a clearnet connection (and our IP) in Tor mode.
+                if !onion {
+                    bail!("refusing non-onion address in tor mode");
+                }
+                let tor = self.tor_ready()?;
+                let deadline = Instant::now() + TOR_DIAL_WINDOW;
+                let stream = loop {
+                    match tor.connect(host, port).await {
+                        Ok(s) => break s,
+                        Err(e) if Instant::now() >= deadline => return Err(e),
+                        Err(_) => tokio::time::sleep(Duration::from_secs(5)).await,
+                    }
+                };
+                tokio::time::timeout(TOR_HANDSHAKE_TIMEOUT, handshake(Box::new(stream), &self.key, true))
+                    .await
+                    .context("handshake timed out")?
+            }
+        }
+    }
+
+    pub async fn accept(&self, listener: &TcpListener) -> Result<TcpStream> {
+        let (stream, _) = listener.accept().await?;
+        stream.set_nodelay(true)?;
+        Ok(stream)
+    }
+
+    pub async fn respond(&self, stream: TcpStream) -> Result<Conn> {
+        let limit = if self.is_tor() { TOR_HANDSHAKE_TIMEOUT } else { TCP_TIMEOUT };
+        tokio::time::timeout(limit, handshake(Box::new(stream), &self.key, false))
+            .await
+            .context("handshake timed out")?
+    }
 }
 
 /// Noise static key for this daemon run. Regenerated at every start and never

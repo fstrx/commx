@@ -99,10 +99,13 @@ async fn main() -> Result<()> {
     send(&mut w, &IpcRequest::Status).await?;
     let mut terminal = ratatui::init();
     let mut app = App::new();
+    // Refresh status (tor bootstrap, keep-awake) periodically.
+    let mut refresh = tokio::time::interval(Duration::from_secs(3));
     let result: Result<()> = async {
         loop {
             terminal.draw(|f| ui::draw(f, &app))?;
             let reqs = tokio::select! {
+                _ = refresh.tick() => vec![IpcRequest::Status],
                 ev = ev_rx.recv() => match ev {
                     Some(ev) => app.on_event(ev),
                     None => bail!("daemon connection closed"),

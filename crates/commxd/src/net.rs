@@ -18,8 +18,7 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit};
 
 use crate::state::{lock, Peer, PeerKind, Role, Room, Shared, MAX_LINES, PEER_QUEUE};
 use commx_core::secmem::SealedLog;
-use crate::transport::tcp::TcpTransport;
-use crate::transport::{SecureReader, SecureWriter, Transport};
+use crate::transport::{Net, SecureReader, SecureWriter};
 
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -59,7 +58,7 @@ async fn reader_loop(
 /// released as soon as the join is decided.
 pub async fn handle_inbound(
     shared: Shared,
-    transport: Arc<TcpTransport>,
+    transport: Arc<Net>,
     stream: TcpStream,
     permit: OwnedSemaphorePermit,
 ) {
@@ -87,7 +86,7 @@ pub async fn handle_inbound(
 }
 
 /// Member side: dial a host from an invite code and join its room.
-pub async fn join(shared: Shared, transport: Arc<TcpTransport>, code: &str) -> Result<RoomId> {
+pub async fn join(shared: Shared, transport: Arc<Net>, code: &str) -> Result<RoomId> {
     let invite = Invite::decode(code)?;
     let me = {
         let d = lock(&shared);
@@ -152,6 +151,8 @@ pub async fn join(shared: Shared, transport: Arc<TcpTransport>, code: &str) -> R
             lines: SealedLog::new(MAX_LINES),
             role: Role::Member { host: Peer::new(tx, cancel_tx) },
             last_hb: Instant::now(),
+            addr: String::new(),
+            onion: None,
         };
         room.system(
             &ev,

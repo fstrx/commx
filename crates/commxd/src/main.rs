@@ -25,8 +25,7 @@ use tokio::sync::Semaphore;
 const MAX_PREAUTH: usize = 32;
 
 use state::{lock, Daemon, Shared};
-use transport::tcp::TcpTransport;
-use transport::NodeKey;
+use transport::{Net, NodeKey};
 
 #[derive(Parser)]
 #[command(name = "commxd", about = "commx node daemon")]
@@ -46,6 +45,13 @@ struct Args {
     /// Don't hold a sleep inhibitor while rooms are live.
     #[arg(long)]
     no_keep_awake: bool,
+    /// Route everything over Tor: each room gets its own onion address and
+    /// peers never see your IP. Launches a private tor process.
+    #[arg(long)]
+    tor: bool,
+    /// tor executable to launch in --tor mode.
+    #[arg(long, default_value = "tor")]
+    tor_bin: String,
 }
 
 fn private_dir(p: &Path) -> Result<()> {
@@ -96,16 +102,27 @@ async fn main() -> Result<()> {
     }
     let ipc = bind_socket(&sock_path)?;
 
-    let tcp = TcpListener::bind(&args.listen).await.with_context(|| format!("listen on {}", args.listen))?;
+    // In Tor mode only tor itself may reach us, so listen on loopback.
+    let listen = if args.tor { "127.0.0.1:0".to_string() } else { args.listen.clone() };
+    let tcp = TcpListener::bind(&listen).await.with_context(|| format!("listen on {listen}"))?;
     let bound: SocketAddr = tcp.local_addr()?;
-    let advertise = args.advertise.unwrap_or_else(|| {
-        let ip = if bound.ip().is_unspecified() { guess_ip() } else { bound.ip() };
-        SocketAddr::new(ip, bound.port()).to_string()
-    });
+    let key = NodeKey::generate()?;
+    let transport = if args.tor {
+        let net = Arc::new(Net::tor(key, bound.port()));
+        let tor_dir = data_dir.join("tor");
+        private_dir(&tor_dir)?;
+        net.start_tor(args.tor_bin.clone(), tor_dir);
+        net
+    } else {
+        let advertise = args.advertise.clone().unwrap_or_else(|| {
+            let ip = if bound.ip().is_unspecified() { guess_ip() } else { bound.ip() };
+            SocketAddr::new(ip, bound.port()).to_string()
+        });
+        Arc::new(Net::tcp(key, bound.port(), advertise))
+    };
 
-    let shared: Shared = Arc::new(Mutex::new(Daemon::new(data_dir, advertise.clone(), !args.no_keep_awake)));
-    let transport = Arc::new(TcpTransport { key: Arc::new(NodeKey::generate()?) });
-    eprintln!("commxd listening on {bound} (invites use {advertise}), control socket {}", sock_path.display());
+    let shared: Shared = Arc::new(Mutex::new(Daemon::new(data_dir, transport.clone(), !args.no_keep_awake)));
+    eprintln!("commxd up: {} · control socket {}", transport.label(), sock_path.display());
 
     {
         let (shared, transport) = (shared.clone(), transport.clone());

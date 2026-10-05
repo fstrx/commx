@@ -24,8 +24,13 @@ impl Node {
     }
 
     fn spawn_in(dir: PathBuf) -> Self {
+        Self::spawn_with(dir, &[])
+    }
+
+    fn spawn_with(dir: PathBuf, extra: &[&str]) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_commxd"))
             .args(["--data-dir", dir.to_str().unwrap(), "--listen", "127.0.0.1:0", "--no-keep-awake"])
+            .args(extra)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -278,4 +283,50 @@ fn member_flood_is_rate_limited() {
     let got = a.rx.try_iter().filter(|v| v["ev"] == "line" && v["line"]["from"] == "bob").count();
     // burst of 20 plus ~5/s refill over the send window
     assert!((20..=35).contains(&got), "host accepted {got} of 100");
+}
+
+/// Needs a `tor` binary and internet access: `cargo test -- --ignored tor`.
+#[test]
+#[ignore]
+fn tor_room_over_onion_services() {
+    let tor_node = |tag: &str| {
+        let dir = std::env::temp_dir().join(format!("cx-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Node::spawn_with(dir, &["--tor"])
+    };
+    let (mut a, mut b) = (tor_node("tor-a"), tor_node("tor-b"));
+    for n in [&mut a, &mut b] {
+        let started = Instant::now();
+        loop {
+            n.req(json!({"op": "status"}));
+            let v = n.expect("status", 10, |v| v["ev"] == "status");
+            let label = v["listen"].as_str().unwrap().to_string();
+            assert!(!label.contains("failed"), "{label}");
+            if label == "tor ready" {
+                eprintln!("tor ready after {:?}", started.elapsed());
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(180), "tor never bootstrapped: {label}");
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    a.alias("alice");
+    b.alias("bob");
+    let (room, code) = a.room("hidden", "HostOnly", 60, false);
+    let addr = commx_core::invite::Invite::decode(&code).unwrap().addr;
+    assert!(addr.ends_with(".onion:4700"), "{addr}");
+
+    let started = Instant::now();
+    b.req(json!({"op": "join", "code": code}));
+    b.expect("join over tor", 200, |v| v["ev"] == "ok" && v["msg"].as_str().unwrap().starts_with("joined"));
+    eprintln!("joined over tor after {:?}", started.elapsed());
+
+    b.send(&room, "hello through three hops");
+    a.expect("message over tor", 60, |v| v["ev"] == "line" && v["line"]["text"] == "hello through three hops");
+    a.send(&room, "and back");
+    b.expect("reply over tor", 60, |v| v["ev"] == "line" && v["line"]["text"] == "and back");
+
+    a.kill();
+    let reason = b.expect_nuked(&room, 90);
+    eprintln!("member nuked: {reason}");
 }

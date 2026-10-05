@@ -14,11 +14,11 @@ use tokio::sync::mpsc;
 
 use crate::net;
 use crate::state::{lock, Shared};
-use crate::transport::tcp::TcpTransport;
+use crate::transport::Net;
 
 const MAX_LINE: usize = 64 * 1024;
 
-pub async fn serve(shared: Shared, transport: Arc<TcpTransport>, listener: UnixListener) {
+pub async fn serve(shared: Shared, transport: Arc<Net>, listener: UnixListener) {
     let uid = unsafe { libc::getuid() };
     loop {
         let Ok((stream, _)) = listener.accept().await else { continue };
@@ -30,7 +30,7 @@ pub async fn serve(shared: Shared, transport: Arc<TcpTransport>, listener: UnixL
     }
 }
 
-async fn client(shared: Shared, transport: Arc<TcpTransport>, stream: UnixStream) {
+async fn client(shared: Shared, transport: Arc<Net>, stream: UnixStream) {
     let (r, mut w) = stream.into_split();
     let (tx, mut rx) = mpsc::unbounded_channel::<IpcEvent>();
     let mut sub = lock(&shared).events.subscribe();
@@ -73,7 +73,7 @@ fn ok(tx: &mpsc::UnboundedSender<IpcEvent>, msg: impl Into<String>) {
 
 async fn handle(
     shared: &Shared,
-    transport: &Arc<TcpTransport>,
+    transport: &Arc<Net>,
     req: IpcRequest,
     tx: &mpsc::UnboundedSender<IpcEvent>,
 ) -> Result<()> {
@@ -128,8 +128,21 @@ async fn handle(
             let _ = tx.send(d.status());
         }
         IpcRequest::RoomNew { name, kill_mode, grace_secs, dm } => {
+            let endpoint = transport.room_endpoint().await?;
+            let onion = endpoint.1.clone();
             let mut d = lock(shared);
-            let id = d.create_room(&name, kill_mode, grace_secs, dm)?;
+            let id = match d.create_room(&name, kill_mode, grace_secs, dm, endpoint) {
+                Ok(id) => id,
+                Err(e) => {
+                    if let Some(o) = onion {
+                        transport.release(o);
+                    }
+                    return Err(e);
+                }
+            };
+            if transport.is_tor() {
+                ok(tx, "onion address publishing; friends may need ~1 min before /join connects");
+            }
             let code = d.make_invite(&id)?;
             let _ = tx.send(IpcEvent::InviteCode { room_id: room_id_hex(&id), name, code });
         }

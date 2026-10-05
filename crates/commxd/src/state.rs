@@ -22,6 +22,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use zeroize::Zeroizing;
 
 use crate::power::Power;
+use crate::transport::Net;
 
 pub type Shared = Arc<Mutex<Daemon>>;
 
@@ -173,6 +174,10 @@ pub struct Room {
     pub lines: SealedLog,
     pub role: Role,
     pub last_hb: Instant,
+    /// Where invites point (host only).
+    pub addr: String,
+    /// This room's onion service, taken down on nuke (Tor mode, host only).
+    pub onion: Option<String>,
 }
 
 impl Room {
@@ -379,7 +384,7 @@ impl Room {
 
 pub struct Daemon {
     pub data_dir: PathBuf,
-    pub advertise: String,
+    pub net: Arc<Net>,
     pub aliases: Vec<AliasEntry>,
     pub active: Option<usize>,
     pub rooms: HashMap<RoomId, Room>,
@@ -389,10 +394,10 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    pub fn new(data_dir: PathBuf, advertise: String, keep_awake: bool) -> Self {
+    pub fn new(data_dir: PathBuf, net: Arc<Net>, keep_awake: bool) -> Self {
         Self {
             data_dir,
-            advertise,
+            net,
             aliases: Vec::new(),
             active: None,
             rooms: HashMap::new(),
@@ -445,7 +450,7 @@ impl Daemon {
         IpcEvent::Status {
             alias: id.as_ref().map(|i| i.name.clone()),
             fingerprint: id.as_ref().map(|i| i.fingerprint()),
-            listen: self.advertise.clone(),
+            listen: self.net.label(),
             power: self.power.label(),
             rooms: self.rooms.values().map(Room::summary).collect(),
         }
@@ -456,7 +461,15 @@ impl Daemon {
         self.power.set_active(active);
     }
 
-    pub fn create_room(&mut self, name: &str, kill_mode: KillMode, grace_secs: u64, dm: bool) -> Result<RoomId> {
+    /// `addr`/`onion` come from [`Net::room_endpoint`].
+    pub fn create_room(
+        &mut self,
+        name: &str,
+        kill_mode: KillMode,
+        grace_secs: u64,
+        dm: bool,
+        (addr, onion): (String, Option<String>),
+    ) -> Result<RoomId> {
         let me = self.active_identity()?;
         let name = name.trim();
         if !valid_name(name, 48) {
@@ -482,6 +495,8 @@ impl Daemon {
             lines: SealedLog::new(MAX_LINES),
             role: Role::Host { peers: HashMap::new() },
             last_hb: Instant::now(),
+            addr,
+            onion,
         };
         room.keys.insert(0, RoomKey::generate());
         let ev = self.events.clone();
@@ -510,7 +525,7 @@ impl Daemon {
         }
         let mut token = [0u8; 16];
         OsRng.fill_bytes(&mut token);
-        let invite = Invite { addr: self.advertise.clone(), host: room.host.id, room_id: *room_id, token };
+        let invite = Invite { addr: room.addr.clone(), host: room.host.id, room_id: *room_id, token };
         self.invites.insert(token, PendingInvite { room_id: *room_id, expires: Instant::now() + INVITE_TTL });
         Ok(invite.encode())
     }

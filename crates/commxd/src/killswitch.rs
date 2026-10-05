@@ -101,6 +101,9 @@ impl Daemon {
             }
         }
         self.invites.retain(|_, i| &i.room_id != room_id);
+        if let Some(onion) = &room.onion {
+            self.net.release(onion.clone());
+        }
         self.emit(IpcEvent::Nuked {
             room_id: room_id_hex(room_id),
             name: room.cfg.name.clone(),
