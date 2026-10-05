@@ -8,6 +8,7 @@ pub mod invite;
 pub mod ipc;
 pub mod keystore;
 pub mod room;
+pub mod secmem;
 pub mod text;
 pub mod wire;
 

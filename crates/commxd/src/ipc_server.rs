@@ -3,12 +3,14 @@
 use anyhow::{anyhow, Result};
 use commx_core::identity::Identity;
 use commx_core::ipc::{IpcEvent, IpcRequest};
+use commx_core::secmem::ZLines;
 use commx_core::text::valid_name;
 use commx_core::{keystore, parse_room_id, room_id_hex, RoomId};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
+use zeroize::Zeroizing;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 use crate::net;
 use crate::state::{lock, Shared};
@@ -35,16 +37,11 @@ async fn client(shared: Shared, transport: Arc<TcpTransport>, stream: UnixStream
 
     let writer = tokio::spawn(async move {
         loop {
-            let ev = tokio::select! {
-                Some(ev) = rx.recv() => ev,
-                res = sub.recv() => match res {
-                    Ok(ev) => ev,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                },
+            let mut line = tokio::select! {
+                Some(ev) = rx.recv() => Zeroizing::new(serde_json::to_vec(&ev).expect("serialize event")),
+                Some(json) = sub.recv() => json,
                 else => break,
             };
-            let mut line = serde_json::to_vec(&ev).expect("serialize event");
             line.push(b'\n');
             if w.write_all(&line).await.is_err() {
                 break;
@@ -52,15 +49,10 @@ async fn client(shared: Shared, transport: Arc<TcpTransport>, stream: UnixStream
         }
     });
 
-    let mut lines = BufReader::new(r);
-    let mut buf = String::new();
+    let mut lines = ZLines::new(r, MAX_LINE);
     loop {
-        buf.clear();
-        match (&mut lines).take(MAX_LINE as u64).read_line(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        let reply = match serde_json::from_str::<IpcRequest>(buf.trim()) {
+        let Ok(Some(line)) = lines.next_line().await else { break };
+        let reply = match serde_json::from_slice::<IpcRequest>(&line) {
             Ok(req) => handle(&shared, &transport, req, &tx).await,
             Err(e) => Err(anyhow!("bad request: {e}")),
         };
@@ -161,7 +153,7 @@ async fn handle(
         IpcRequest::History { room_id } => {
             let id = room_arg(&room_id)?;
             let d = lock(shared);
-            let lines = d.rooms.get(&id).ok_or_else(|| anyhow!("no such room"))?.lines.clone();
+            let lines = d.rooms.get(&id).ok_or_else(|| anyhow!("no such room"))?.lines.all();
             let _ = tx.send(IpcEvent::History { room_id, lines });
         }
         IpcRequest::Nuke { room_id: Some(room_id) } => {

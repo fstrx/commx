@@ -114,9 +114,11 @@ fn room(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(format!("kill:{} {}s ", r.kill_mode.label(), r.grace_secs), mode_style),
         Span::styled(format!("· {} ", r.members.join(", ")), Style::default().fg(DIM)),
     ]);
-    let empty = Vec::new();
-    let lines: Vec<Line> = app.lines.get(&r.room_id).unwrap_or(&empty).iter().map(chat_line).collect();
-    scrolled(f, lines, panel(title, true), area, app.scroll);
+    // Decrypt only what can be on screen; it's dropped (and wiped) after drawing.
+    let rows = area.height.saturating_sub(2) as usize;
+    let visible: Vec<ChatLine> = app.lines.get(&r.room_id).map(|l| l.tail(rows, app.scroll)).unwrap_or_default();
+    let lines: Vec<Line> = visible.iter().map(chat_line).collect();
+    scrolled(f, lines, panel(title, true), area, 0);
 }
 
 fn chat_line(l: &ChatLine) -> Line<'static> {

@@ -2,7 +2,10 @@
 //! doesn't already have, and forgets a room's lines the moment it's nuked.
 
 use commx_core::ipc::{ChatLine, IpcEvent, IpcRequest, RoomSummary};
+use commx_core::secmem::SealedLog;
 use std::collections::{HashMap, HashSet};
+
+const HISTORY: usize = 500;
 
 use crate::commands::{self, Command};
 
@@ -31,7 +34,8 @@ pub struct App {
     pub rooms: Vec<RoomSummary>,
     /// 0 is the home pane; rooms start at 1.
     pub sel: usize,
-    pub lines: HashMap<String, Vec<ChatLine>>,
+    /// Per-room history, encrypted in RAM; decrypted only for drawing.
+    pub lines: HashMap<String, SealedLog>,
     pub home: Vec<(String, bool)>,
     pub unread: HashSet<String>,
     pub input: String,
@@ -83,13 +87,17 @@ impl App {
     }
 
     fn local_line(&mut self, room_id: &str, text: String) {
-        self.lines.entry(room_id.to_string()).or_default().push(ChatLine {
+        self.log_for(room_id).push(&ChatLine {
             from: LOCAL.into(),
             text,
             ts_min: commx_core::now_minute(),
             mine: false,
             system: true,
         });
+    }
+
+    fn log_for(&mut self, room_id: &str) -> &mut SealedLog {
+        self.lines.entry(room_id.to_string()).or_insert_with(|| SealedLog::new(HISTORY))
     }
 
     pub fn select(&mut self, idx: usize) {
@@ -171,14 +179,15 @@ impl App {
                 if self.current().map(|r| &r.room_id) != Some(&room_id) {
                     self.unread.insert(room_id.clone());
                 }
-                self.lines.entry(room_id).or_default().push(line);
+                self.log_for(&room_id).push(&line);
             }
             IpcEvent::History { room_id, lines } => {
                 // Keep invite lines we added locally after whatever history says.
-                let local: Vec<ChatLine> = self.lines.remove(&room_id).unwrap_or_default();
-                let mut merged = lines;
-                merged.extend(local.into_iter().filter(|l| l.from == LOCAL));
-                self.lines.insert(room_id, merged);
+                let local: Vec<ChatLine> = self.lines.remove(&room_id).map(|l| l.all()).unwrap_or_default();
+                let log = self.log_for(&room_id);
+                for l in lines.iter().chain(local.iter().filter(|l| l.from == LOCAL)) {
+                    log.push(l);
+                }
             }
             IpcEvent::Nuked { room_id, name, reason } => {
                 let cur = self.current().map(|r| r.room_id.clone());

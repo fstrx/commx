@@ -29,6 +29,7 @@ clap = { version = "4", features = ["derive"] }
 directories = "5"
 libc = "0.2"
 ratatui = "0.29"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Power", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_Diagnostics_Debug"] }
 
 [profile.release]
 panic = "abort"

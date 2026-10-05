@@ -1,5 +1,9 @@
 //! commx: terminal client for the commx daemon.
 
+// Every freed heap block is wiped, so plaintext doesn't outlive its use.
+#[global_allocator]
+static ALLOC: commx_core::secmem::ZeroizingAlloc = commx_core::secmem::ZeroizingAlloc;
+
 mod app;
 mod commands;
 mod ui;
@@ -10,7 +14,8 @@ use commx_core::ipc::{IpcEvent, IpcRequest};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use commx_core::secmem::ZLines;
+use tokio::io::AsyncWriteExt;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -44,6 +49,7 @@ async fn send(w: &mut OwnedWriteHalf, req: &IpcRequest) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    commx_core::secmem::harden_process();
     let args = Args::parse();
     let sock = args
         .socket
@@ -55,9 +61,9 @@ async fn main() -> Result<()> {
 
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<IpcEvent>();
     tokio::spawn(async move {
-        let mut lines = BufReader::new(r).lines();
+        let mut lines = ZLines::new(r, 4 * 1024 * 1024);
         while let Ok(Some(line)) = lines.next_line().await {
-            if let Ok(ev) = serde_json::from_str(&line) {
+            if let Ok(ev) = serde_json::from_slice(&line) {
                 if ev_tx.send(ev).is_err() {
                     break;
                 }

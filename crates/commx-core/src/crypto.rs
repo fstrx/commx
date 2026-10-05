@@ -7,34 +7,34 @@ use x25519_dalek::{EphemeralSecret, PublicKey as DhPublic};
 use zeroize::Zeroizing;
 
 use crate::identity::Identity;
+use crate::secmem::Locked;
 
-/// Symmetric key shared by every member of a room. Wiped on drop, so dropping
-/// it is the core of a nuke: without it, ciphertext is noise.
+/// Symmetric key shared by every member of a room. Lives on a locked page and
+/// is wiped on drop, so dropping it is the core of a nuke: without it,
+/// ciphertext is noise.
 #[derive(Clone)]
-pub struct RoomKey(Zeroizing<[u8; 32]>);
+pub struct RoomKey(Locked<32>);
 
 impl RoomKey {
     pub fn generate() -> Self {
-        let mut k = Zeroizing::new([0u8; 32]);
-        OsRng.fill_bytes(k.as_mut());
-        Self(k)
+        Self(Locked::random())
     }
 
     pub fn from_bytes(b: &[u8]) -> Result<Self> {
-        let arr: [u8; 32] = b.try_into().map_err(|_| anyhow!("bad room key length"))?;
-        Ok(Self(Zeroizing::new(arr)))
+        let arr: &[u8; 32] = b.try_into().map_err(|_| anyhow!("bad room key length"))?;
+        Ok(Self(Locked::from_bytes(arr)))
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
+        self.0.bytes()
     }
 
     pub fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> Result<([u8; 24], Vec<u8>)> {
-        aead_encrypt(&self.0, plaintext, aad)
+        aead_encrypt(self.0.bytes(), plaintext, aad)
     }
 
     pub fn decrypt(&self, nonce: &[u8; 24], ct: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        aead_decrypt(&self.0, nonce, ct, aad)
+        aead_decrypt(self.0.bytes(), nonce, ct, aad)
     }
 }
 

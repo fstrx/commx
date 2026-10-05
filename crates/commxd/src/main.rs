@@ -1,6 +1,10 @@
 //! commxd: the commx node. Runs in the background, holds keys and rooms in
 //! memory, talks to peers over Noise and to the local TUI over a unix socket.
 
+// Every freed heap block is wiped, so plaintext doesn't outlive its use.
+#[global_allocator]
+static ALLOC: commx_core::secmem::ZeroizingAlloc = commx_core::secmem::ZeroizingAlloc;
+
 mod ipc_server;
 mod killswitch;
 mod net;
@@ -44,16 +48,6 @@ struct Args {
     no_keep_awake: bool,
 }
 
-/// No core dumps (they'd contain keys), no ptrace attach on Linux.
-fn harden() {
-    unsafe {
-        let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        libc::setrlimit(libc::RLIMIT_CORE, &zero);
-        #[cfg(target_os = "linux")]
-        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
-    }
-}
-
 fn private_dir(p: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(p)?;
@@ -90,7 +84,7 @@ fn bind_socket(path: &Path) -> Result<UnixListener> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    harden();
+    commx_core::secmem::harden_process();
     let args = Args::parse();
     let data_dir = args.data_dir.unwrap_or_else(commx_core::default_data_dir);
     private_dir(&data_dir)?;

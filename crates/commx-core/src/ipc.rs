@@ -1,6 +1,7 @@
 //! Client ↔ daemon protocol: newline-delimited JSON over a private unix socket.
 
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::room::KillMode;
 
@@ -42,7 +43,9 @@ pub struct AliasInfo {
     pub active: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Wiped on drop: every copy of a message's plaintext that the code holds
+/// is scrubbed when it goes away.
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct ChatLine {
     pub from: String,
     pub text: String,

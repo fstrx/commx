@@ -3,7 +3,8 @@
 
 use anyhow::{anyhow, bail, Result};
 use commx_core::chain::{msg_aad, Block, Body, Chain, ChatPlain, Payload};
-use commx_core::crypto::{open_sealed, seal_to, RoomKey};
+use commx_core::crypto::{aead_decrypt, aead_encrypt, open_sealed, seal_to, RoomKey};
+use commx_core::secmem::{Locked, SealedLog};
 use commx_core::identity::{verify, Identity};
 use commx_core::invite::Invite;
 use commx_core::ipc::{AliasInfo, ChatLine, IpcEvent, RoomSummary};
@@ -18,15 +19,62 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::power::Power;
 
 pub type Shared = Arc<Mutex<Daemon>>;
-pub type Events = broadcast::Sender<IpcEvent>;
+
+/// Broadcast of events to every connected client. Events sit in the ring
+/// buffer until overwritten, so they're stored sealed under a locked key and
+/// only decrypted by each client's writer right before hitting the socket.
+#[derive(Clone)]
+pub struct Events {
+    tx: broadcast::Sender<Arc<([u8; 24], Vec<u8>)>>,
+    key: Arc<Locked<32>>,
+}
+
+pub struct EventSub {
+    rx: broadcast::Receiver<Arc<([u8; 24], Vec<u8>)>>,
+    key: Arc<Locked<32>>,
+}
+
+impl Events {
+    pub fn new() -> Self {
+        Self { tx: broadcast::channel(1024).0, key: Arc::new(Locked::random()) }
+    }
+
+    pub fn send(&self, ev: IpcEvent) {
+        let json = Zeroizing::new(serde_json::to_vec(&ev).expect("serialize event"));
+        if let Ok(sealed) = aead_encrypt(self.key.bytes(), &json, b"commx-ipc") {
+            let _ = self.tx.send(Arc::new(sealed));
+        }
+    }
+
+    pub fn subscribe(&self) -> EventSub {
+        EventSub { rx: self.tx.subscribe(), key: self.key.clone() }
+    }
+}
+
+impl EventSub {
+    /// Next event as JSON bytes. `None` when the daemon is shutting down.
+    pub async fn recv(&mut self) -> Option<Zeroizing<Vec<u8>>> {
+        loop {
+            match self.rx.recv().await {
+                Ok(s) => {
+                    if let Ok(plain) = aead_decrypt(self.key.bytes(), &s.0, &s.1, b"commx-ipc") {
+                        return Some(plain);
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+}
 
 pub const INVITE_TTL: Duration = Duration::from_secs(10 * 60);
-const MAX_LINES: usize = 500;
+pub const MAX_LINES: usize = 500;
 
 pub fn lock(s: &Shared) -> MutexGuard<'_, Daemon> {
     s.lock().unwrap_or_else(|e| e.into_inner())
@@ -121,18 +169,10 @@ pub struct Room {
     pub keys: HashMap<u32, RoomKey>,
     pub epoch: u32,
     pub chain: Chain,
-    pub lines: Vec<ChatLine>,
+    /// History, encrypted in RAM; dropped (key wiped) on nuke.
+    pub lines: SealedLog,
     pub role: Role,
     pub last_hb: Instant,
-}
-
-impl Drop for Room {
-    fn drop(&mut self) {
-        for l in &mut self.lines {
-            l.text.zeroize();
-            l.from.zeroize();
-        }
-    }
 }
 
 impl Room {
@@ -159,12 +199,8 @@ impl Room {
     }
 
     fn push(&mut self, ev: &Events, line: ChatLine) {
-        if self.lines.len() >= MAX_LINES {
-            let mut old = self.lines.remove(0);
-            old.text.zeroize();
-        }
-        self.lines.push(line.clone());
-        let _ = ev.send(IpcEvent::Line { room_id: room_id_hex(&self.id), line });
+        self.lines.push(&line);
+        ev.send(IpcEvent::Line { room_id: room_id_hex(&self.id), line });
     }
 
     pub fn system(&mut self, ev: &Events, text: impl Into<String>) {
@@ -255,7 +291,7 @@ impl Room {
                     self.members.push(member.clone());
                 }
                 self.system(ev, format!("{} joined [{}]", member.name, member.id.fingerprint()));
-                let _ = ev.send(IpcEvent::Room { room: self.summary() });
+                ev.send(IpcEvent::Room { room: self.summary() });
             }
             Body::Leave { sign_pk } => {
                 if !from_host {
@@ -264,7 +300,7 @@ impl Room {
                 let name = self.name_of(sign_pk).unwrap_or_else(|| "?".into());
                 self.members.retain(|m| &m.id.sign_pk != sign_pk);
                 self.system(ev, format!("{name} dropped"));
-                let _ = ev.send(IpcEvent::Room { room: self.summary() });
+                ev.send(IpcEvent::Room { room: self.summary() });
             }
         }
         Ok(())
@@ -361,13 +397,13 @@ impl Daemon {
             active: None,
             rooms: HashMap::new(),
             invites: HashMap::new(),
-            events: broadcast::channel(1024).0,
+            events: Events::new(),
             power: Power::new(keep_awake),
         }
     }
 
     pub fn emit(&self, ev: IpcEvent) {
-        let _ = self.events.send(ev);
+        self.events.send(ev);
     }
 
     pub fn active_identity(&self) -> Result<Arc<Identity>> {
@@ -443,7 +479,7 @@ impl Daemon {
             host,
             keys: HashMap::new(),
             epoch: 0,
-            lines: Vec::new(),
+            lines: SealedLog::new(MAX_LINES),
             role: Role::Host { peers: HashMap::new() },
             last_hb: Instant::now(),
         };

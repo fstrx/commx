@@ -1,15 +1,19 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey as DhPublic, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use crate::secmem::Locked;
+
 /// A local alias. Each alias has its own unrelated keys, so two aliases on the
 /// same machine can't be linked through key material.
+///
+/// Secret keys live on a locked page (`sign_sk || dh_sk`); short-lived
+/// dalek key objects are built per operation and zeroized on drop.
 pub struct Identity {
     pub name: String,
-    sign: SigningKey,
-    dh: StaticSecret,
+    keys: Locked<64>,
+    public: PublicIdentity,
 }
 
 /// The public half of an alias, safe to hand to peers.
@@ -29,43 +33,58 @@ pub struct IdentitySecret {
 
 impl Identity {
     pub fn generate(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            sign: SigningKey::generate(&mut OsRng),
-            dh: StaticSecret::random_from_rng(OsRng),
-        }
+        Self::from_keys(name.into(), Locked::random())
+    }
+
+    fn from_keys(name: String, keys: Locked<64>) -> Self {
+        let mut id = Self {
+            name,
+            keys,
+            public: PublicIdentity { sign_pk: [0; 32], dh_pk: [0; 32] },
+        };
+        id.public = PublicIdentity {
+            sign_pk: id.signing_key().verifying_key().to_bytes(),
+            dh_pk: DhPublic::from(&id.dh_secret()).to_bytes(),
+        };
+        id
     }
 
     pub fn from_secret(s: &IdentitySecret) -> Self {
-        Self {
-            name: s.name.clone(),
-            sign: SigningKey::from_bytes(&s.sign_sk),
-            dh: StaticSecret::from(s.dh_sk),
-        }
+        let mut keys = Locked::<64>::zeroed();
+        keys.bytes_mut()[..32].copy_from_slice(&s.sign_sk);
+        keys.bytes_mut()[32..].copy_from_slice(&s.dh_sk);
+        Self::from_keys(s.name.clone(), keys)
     }
 
     pub fn to_secret(&self) -> IdentitySecret {
+        let k = self.keys.bytes();
         IdentitySecret {
             name: self.name.clone(),
-            sign_sk: self.sign.to_bytes(),
-            dh_sk: self.dh.to_bytes(),
+            sign_sk: k[..32].try_into().unwrap(),
+            dh_sk: k[32..].try_into().unwrap(),
         }
+    }
+
+    fn signing_key(&self) -> SigningKey {
+        SigningKey::from_bytes(self.keys.bytes()[..32].try_into().unwrap())
+    }
+
+    fn dh_secret(&self) -> StaticSecret {
+        let bytes: Zeroizing<[u8; 32]> = Zeroizing::new(self.keys.bytes()[32..].try_into().unwrap());
+        StaticSecret::from(*bytes)
     }
 
     pub fn public(&self) -> PublicIdentity {
-        PublicIdentity {
-            sign_pk: self.sign.verifying_key().to_bytes(),
-            dh_pk: DhPublic::from(&self.dh).to_bytes(),
-        }
+        self.public
     }
 
     pub fn sign(&self, msg: &[u8]) -> Vec<u8> {
-        self.sign.sign(msg).to_bytes().to_vec()
+        self.signing_key().sign(msg).to_bytes().to_vec()
     }
 
     /// X25519 with a peer public key. The result is wiped on drop.
     pub fn dh(&self, peer: &[u8; 32]) -> Zeroizing<[u8; 32]> {
-        Zeroizing::new(self.dh.diffie_hellman(&DhPublic::from(*peer)).to_bytes())
+        Zeroizing::new(self.dh_secret().diffie_hellman(&DhPublic::from(*peer)).to_bytes())
     }
 
     pub fn fingerprint(&self) -> String {

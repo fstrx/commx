@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit};
 
-use crate::state::{lock, Peer, PeerKind, Role, Room, Shared, PEER_QUEUE};
+use crate::state::{lock, Peer, PeerKind, Role, Room, Shared, MAX_LINES, PEER_QUEUE};
+use commx_core::secmem::SealedLog;
 use crate::transport::tcp::TcpTransport;
 use crate::transport::{SecureReader, SecureWriter, Transport};
 
@@ -148,7 +149,7 @@ pub async fn join(shared: Shared, transport: Arc<TcpTransport>, code: &str) -> R
             members,
             keys: HashMap::from([(epoch, key)]),
             epoch,
-            lines: Vec::new(),
+            lines: SealedLog::new(MAX_LINES),
             role: Role::Member { host: Peer::new(tx, cancel_tx) },
             last_hb: Instant::now(),
         };
