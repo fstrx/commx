@@ -16,8 +16,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use commx_core::secmem::ZLines;
 use tokio::io::AsyncWriteExt;
-use tokio::net::unix::OwnedWriteHalf;
-use tokio::net::UnixStream;
+use commx_core::local_ipc::{self, Writer};
 use tokio::sync::mpsc;
 
 use app::App;
@@ -25,9 +24,9 @@ use app::App;
 #[derive(Parser)]
 #[command(name = "commx", about = "private P2P chat — terminal client")]
 struct Args {
-    /// commxd control socket [default: <data-dir>/commxd.sock]
+    /// commxd control endpoint: socket path, or pipe name on Windows [default: per data dir]
     #[arg(long)]
-    socket: Option<PathBuf>,
+    socket: Option<String>,
     #[arg(long)]
     data_dir: Option<PathBuf>,
     #[command(subcommand)]
@@ -40,7 +39,7 @@ enum Cmd {
     Nuke,
 }
 
-async fn send(w: &mut OwnedWriteHalf, req: &IpcRequest) -> Result<()> {
+async fn send(w: &mut Writer, req: &IpcRequest) -> Result<()> {
     let mut line = serde_json::to_vec(req)?;
     line.push(b'\n');
     w.write_all(&line).await?;
@@ -51,13 +50,12 @@ async fn send(w: &mut OwnedWriteHalf, req: &IpcRequest) -> Result<()> {
 async fn main() -> Result<()> {
     commx_core::secmem::harden_process();
     let args = Args::parse();
-    let sock = args
-        .socket
-        .unwrap_or_else(|| args.data_dir.unwrap_or_else(commx_core::default_data_dir).join("commxd.sock"));
-    let stream = UnixStream::connect(&sock)
+    let endpoint = args.socket.unwrap_or_else(|| {
+        local_ipc::default_endpoint(&args.data_dir.unwrap_or_else(commx_core::default_data_dir))
+    });
+    let (r, mut w) = local_ipc::connect(&endpoint)
         .await
-        .with_context(|| format!("can't reach commxd at {} — is the daemon running?", sock.display()))?;
-    let (r, mut w) = stream.into_split();
+        .with_context(|| format!("can't reach commxd at {endpoint} — is the daemon running?"))?;
 
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<IpcEvent>();
     tokio::spawn(async move {

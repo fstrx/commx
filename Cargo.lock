@@ -355,6 +355,7 @@ dependencies = [
  "serde_json",
  "snow",
  "tokio",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 

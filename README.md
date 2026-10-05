@@ -1,111 +1,126 @@
 # commx
 
-commx is a peer-to-peer chat for small groups of friends. Messages are end-to-end encrypted and live only in memory. There are no servers, no accounts and no phone numbers, only aliases. Rooms self-destruct when nodes drop.
+commx is peer-to-peer chat and file sharing for small groups of friends. Everything is end-to-end encrypted. There are no servers, no accounts and no phone numbers, only aliases. Rooms self-destruct when nodes drop. It runs over Tor, or over direct TCP for a LAN or VPN.
 
 ```
- commx (TUI) ──unix socket── commxd ──TCP + Noise_XX── other commxd nodes
+ commx (TUI) ──private socket / pipe── commxd ──Noise_XX over TCP or Tor── other commxd nodes
 ```
 
-- **`commxd`**: the node. It runs in the background, holds keys and rooms in RAM, and talks to peers.
-- **`commx`**: the terminal client. It talks only to your local `commxd`.
+- **`commxd`** is the node. It runs in the background, holds keys and rooms in locked memory, and talks to peers.
+- **`commx`** is the terminal client. It talks only to your local `commxd`.
 
-## Quick start
+It runs on macOS, Linux and Windows. Android is planned.
+
+## Install
+
+### macOS / Linux
 
 ```sh
 cargo install --path crates/commxd
 cargo install --path crates/commx
-
-commxd &            # or install the launchd / systemd unit from dist/
+commxd --tor &        # or without --tor on a LAN/VPN; launchd/systemd units in dist/
 commx
 ```
 
-Inside the TUI:
+Tor mode needs a `tor` binary on your PATH. On macOS that's `brew install tor`; on Linux, `apt install tor` or similar.
+
+### Windows
+
+1. Get `commx-windows-x86_64.zip` from a release (built by CI), or build it yourself with `cargo build --release`.
+2. Run `powershell -ExecutionPolicy Bypass -File install-windows.ps1`. This installs to `%LOCALAPPDATA%\commx`, starts `commxd` hidden at logon and adds `commx` to your PATH.
+3. Open a new terminal (Windows Terminal recommended) and run `commx`.
+4. For Tor mode, install the Tor Expert Bundle. Then add `--tor --tor-bin C:\path\to\tor.exe` to the `commxd` Startup shortcut.
+
+## Use
 
 ```
-/alias new ghost --ephemeral          # RAM-only identity (or drop --ephemeral to save it, passphrase-encrypted)
-/room new lounge --any-member         # host a room; prints a single-use invite code
+/alias new ghost --ephemeral        RAM-only identity (drop --ephemeral to save it, passphrase-encrypted)
+/room new lounge --any-member       host a room; prints a single-use invite (cx1:...)
+/join cx1:...                       join a friend's room
+/send ~/notes.pdf                   share a file (max 256 MiB)
+/files   /save 1 [path]             list files / export a decrypted copy
+/nuke    /nuke all                  destroy this room / everything
 ```
 
-Send the `cx1:...` code to a friend over a channel you trust. They run `/join cx1:...`. Each side shows a fingerprint for the other (`[abcd-efgh-...]`). Compare fingerprints out-of-band once.
+Send invite codes over a channel you trust. Each side shows a fingerprint for the other (`[abcd-efgh-...]`); compare fingerprints once, out of band. Panic button from any shell: `commx nuke`.
 
-Panic button from any shell: `commx nuke`.
+## Network
 
-### Reaching each other
-
-The MVP uses direct TCP on port 4700. Friends must be able to reach the host's address in one of these ways:
-
-- the same LAN;
-- a VPN/mesh like Tailscale or WireGuard (run `commxd --advertise 100.x.y.z:4700`);
-- a port forward.
-
-Tor onion services are the next milestone. They solve NAT traversal and hide IPs.
+- **`--tor` (recommended).** `commxd` launches its own private tor process, which exits with it.
+  - **Room addresses:** every room gets its own onion address. The keys are discarded at creation and the onion is deleted on nuke.
+  - **Outgoing connections:** each one uses its own circuit.
+  - **No IP leaks:** peers never see your IP. Clearnet addresses are refused, and the listener binds to loopback only.
+  - **Timing:** first bootstrap takes about 15–30s. A new room's onion takes up to a minute before friends can join.
+- **Direct TCP (default).** Port 4700. Use this on a LAN, or over Tailscale/WireGuard with `--advertise 100.x.y.z:4700`, or with a port forward. Peers see each other's IP.
 
 ## Kill switch
 
-Each room picks its kill mode at creation. All members enforce the mode the host chose.
+Each room chooses its kill mode when it's created. Every member enforces the host's choice.
 
 | mode | host drops | a member drops |
 |---|---|---|
 | `host-only` (default) | room nuked everywhere | member removed, room key rotated |
 | `any-member` (`--any-member`, all DMs) | room nuked everywhere | room nuked everywhere |
 
-- **Disconnects:** a closed connection counts as a drop immediately.
-- **Silence:** a peer that goes quiet (frozen, network gone, laptop asleep) counts as dropped after `--grace N` seconds (default 15). Heartbeats run every ≤5s.
-- **Cascade:** a node going down takes out every room it was in, each according to that room's mode.
-- **Stopping the daemon:** stopping `commxd` with Ctrl-C or SIGTERM nukes all its rooms and notifies peers.
-- **What a nuke does:** it zeroizes the room key and the chain head, wipes message plaintext from memory, drops connections and deletes pending invites. Nothing was ever written to disk, so nothing on disk needs wiping.
+- **Disconnect:** a closed connection is a drop immediately.
+- **Silence:** a silent peer (frozen, offline, asleep) counts as dropped after `--grace N` seconds (default 15).
+- **Shutdown:** stopping `commxd` nukes its rooms and tells the peers.
+- **What a nuke does:** it wipes the room key, the chain head, the sealed history and the file keys. It deletes the blob files, drops connections and takes the onion down.
 
-### Sleep
+**Sleep.** While any room is live, `commxd` keeps the machine awake: `caffeinate` on macOS, `systemd-inhibit` on Linux, `SetThreadExecutionState` on Windows. Closing a laptop lid still sleeps it. On wake, rooms past their grace window wipe themselves. For rooms that should survive your laptop, host them on an always-on box.
 
-A sleeping machine can't keep connections alive.
+## Files
 
-- **Keeping the machine awake:** while any room is live, `commxd` holds a sleep inhibitor: `caffeinate -i -s` on macOS, `systemd-inhibit` on Linux. Disable this with `--no-keep-awake`.
-- **Lid close:** closing a laptop lid still sleeps it. The status bar warns you when you're on battery.
-- **Waking up:** on wake, `commxd` detects that it slept past the grace window and wipes the affected rooms itself. Peers will already have nuked them.
-- **Long-lived rooms:** host the room on an always-on box like a Pi, VPS or home server.
+- **Announcement.** A file is announced through the room's signed hash chain. The announcement carries the name, size, BLAKE3 hash and a per-file key, all sealed under the room key.
+- **Transfer.** Chunks travel on a separate bulk lane. Heartbeats always go first, so a big transfer can't trip the kill switch. The host relays chunks only from the person who announced the file.
+- **On disk.**
+  - Received files live in `<data-dir>/blobs/<random>.blob`.
+  - Each blob is fixed-size encrypted slots, padded up to a size bucket with random bytes.
+  - Blob names, sizes and contents say nothing about the file.
+  - The file key exists only in RAM, so after a nuke (or a crash) a blob is noise. Blobs are unlinked on nuke, and orphans are purged at startup.
+- **Export.** `/save` checks the hash and writes a decrypted copy. That copy is yours, and commx can't nuke it.
+
+## Memory hardening
+
+The goal: a RAM dump or memory scan of commx shouldn't reveal messages.
+
+- **Zero-on-free allocator** in both binaries. Every freed heap block is wiped, so plaintext doesn't linger.
+- **Sealed history.** Chat history is kept *encrypted in RAM*, in both daemon and TUI. The TUI decrypts only the rows it's drawing.
+- **Locked keys.** Keys live on locked pages: `mlock`/`VirtualLock`, `MADV_DONTDUMP`, wiped on free.
+- **Sealed IPC.** The IPC event ring is sealed, and line buffers are wiped.
+- **Process hardening.**
+  - Core dumps are disabled everywhere.
+  - Linux sets `PR_SET_DUMPABLE=0`.
+  - macOS release builds refuse debugger attach.
+  - Windows crash dumps (Windows Error Reporting) are disabled.
+
+Verified: an lldb dump of a live host daemon after 10 canary messages contains **0** copies of them. The same scan of the pre-hardening build found plaintext.
+
+Limits: text is plaintext while it's on screen. Your terminal emulator holds what it displays. Root or kernel-level access to a *running* process can still grab keys.
 
 ## Crypto
 
 | piece | what |
 |---|---|
-| alias | Ed25519 (signing) + X25519 (key agreement). Each alias has its own keys, so aliases are unlinkable. |
-| transport | Noise `XX_25519_ChaChaPoly_BLAKE2s`, with a fresh node key every daemon run. Aliases prove identity by signing the Noise handshake hash (channel binding). |
-| room messages | XChaCha20-Poly1305 under a random room key. The host seals the key to each member's X25519 key and rotates it when someone is removed. |
-| "blockchain" | Per-room hash chain. Every block is signed by its author **and** the host, and links `blake3(prev)`. Members reject gaps, reorders, forgeries and splices, and they nuke the room if verification fails. There's no mining and no global ledger. The chain lives only in RAM. |
-| saved aliases | Argon2id(passphrase) → XChaCha20-Poly1305, stored as randomly named files in a 0700 directory. |
-| metadata | Timestamps are coarsened to the minute. Core dumps are disabled. The control socket is 0600 and checks the peer UID. |
+| alias | Ed25519 + X25519. Each alias has its own keys, so aliases are unlinkable. |
+| transport | Noise `XX_25519_ChaChaPoly_BLAKE2s` with a fresh node key per run. Aliases sign the handshake hash (channel binding). |
+| room | XChaCha20-Poly1305 room key, sealed to each member and rotated on removal. |
+| "blockchain" | Per-room hash chain, double-signed (author + host). Members reject gaps, reorders, forgeries and splices, and nuke the room if verification fails. It lives only in RAM. |
+| saved aliases | Argon2id (64 MiB, t=3) → XChaCha20-Poly1305, with authenticated parameters. Files have random names and sit in a private directory. |
 
-## Honest limits
+See [SECURITY.md](SECURITY.md) for the audit and known limits.
 
-- **A nuke is cooperative.** A modified client, a screenshot or a camera can keep anything you send. commx protects against outsiders and careless leftovers. It doesn't protect against a friend who decides to betray you.
-- **Peers see your IP** until Tor transport lands.
-- **The host sees room metadata:** who's in the room and when they talk. The host can read messages too, because the host is a room member.
-- **There's no reconnect.** A real disconnect is a drop by design.
-- **Memory isn't locked.** It isn't `mlock`ed yet, so swap could hold key material. Use encrypted swap (default on macOS).
-- **No audit.** The code hasn't been audited. It's an MVP.
-
-## Layout
-
-```
-crates/commx-core   identities, crypto, hash chain, wire + IPC formats (no IO)
-crates/commxd       daemon: transport, rooms, kill switch, power, IPC server
-crates/commx        ratatui TUI
-dist/               launchd + systemd units
-```
-
-## Tests
+## Develop
 
 ```sh
-cargo test --workspace
+cargo test --workspace                                 # unit + end-to-end (real daemons, SIGKILL/SIGSTOP)
+cargo test -p commxd --test rooms -- --ignored tor     # live Tor test (needs tor + internet)
+cargo clippy --target x86_64-pc-windows-gnu --workspace --all-targets -- -D warnings   # Windows check
 ```
 
-The integration tests in `crates/commxd/tests/rooms.rs` spawn real daemons on localhost. They kill nodes with SIGKILL, and freeze nodes with SIGSTOP to exercise the silent-timeout path.
-
-## Roadmap
-
-1. Tor onion-service transport (per alias), implementing the existing `Transport` trait.
-2. File sharing:
-   - files are chunked, encrypted with the room key and stored as randomly named, size-padded blobs;
-   - keys are kept only in RAM, so a nuke crypto-shreds the blobs and unlinks them.
-3. Reconnect within the grace window, plus catch-up of missed blocks.
-4. `mlock` for key material, and memory hygiene for TUI buffers.
+```
+crates/commx-core   identities, crypto, hash chain, secmem, local IPC, wire/IPC formats
+crates/commxd       daemon: transports (TCP/Tor), rooms, kill switch, files, power, IPC server
+crates/commx        ratatui TUI
+dist/               launchd, systemd, Windows installer
+```

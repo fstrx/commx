@@ -1,5 +1,6 @@
 //! commxd: the commx node. Runs in the background, holds keys and rooms in
-//! memory, talks to peers over Noise and to the local TUI over a unix socket.
+//! memory, talks to peers over Noise and to the local TUI over a private
+//! unix socket (Windows: named pipe).
 
 // Every freed heap block is wiped, so plaintext doesn't outlive its use.
 #[global_allocator]
@@ -13,13 +14,14 @@ mod power;
 mod state;
 mod transport;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::net::{TcpListener, UnixListener};
+use commx_core::local_ipc;
+use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
 /// Connections allowed in the handshake/join phase at once.
@@ -34,9 +36,9 @@ struct Args {
     /// Where encrypted alias files live (nothing else is ever written).
     #[arg(long)]
     data_dir: Option<PathBuf>,
-    /// Control socket path [default: <data-dir>/commxd.sock]
+    /// Control endpoint: socket path, or pipe name on Windows [default: per data dir]
     #[arg(long)]
-    socket: Option<PathBuf>,
+    socket: Option<String>,
     /// Address to accept peers on.
     #[arg(long, default_value = "0.0.0.0:4700")]
     listen: String,
@@ -53,12 +55,44 @@ struct Args {
     /// tor executable to launch in --tor mode.
     #[arg(long, default_value = "tor")]
     tor_bin: String,
+    /// Windows: relaunch in the background with no console window.
+    #[cfg(windows)]
+    #[arg(long)]
+    detach: bool,
 }
 
+/// Create a directory only we can read. On Windows, the user profile's
+/// inherited ACL already restricts it to the user.
 fn private_dir(p: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(p)?;
-    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+        let (mut close, mut shutdown, mut logoff) = (windows::ctrl_close()?, windows::ctrl_shutdown()?, windows::ctrl_logoff()?);
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = close.recv() => {}
+            _ = shutdown.recv() => {}
+            _ = logoff.recv() => {}
+        }
+    }
     Ok(())
 }
 
@@ -72,36 +106,42 @@ fn guess_ip() -> IpAddr {
         .unwrap_or(IpAddr::from([127, 0, 0, 1]))
 }
 
-fn bind_socket(path: &Path) -> Result<UnixListener> {
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        // Only ever delete a stale socket, never some other file.
-        if !meta.file_type().is_socket() {
-            bail!("{} exists and is not a socket", path.display());
-        }
-        if std::os::unix::net::UnixStream::connect(path).is_ok() {
-            bail!("commxd already running on {}", path.display());
-        }
-        std::fs::remove_file(path)?;
-    }
-    let l = UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(l)
+/// Re-run ourselves without `--detach`, with no console, and exit.
+#[cfg(windows)]
+fn detach() -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--detach").collect();
+    std::process::Command::new(std::env::current_exe()?)
+        .args(args)
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     commx_core::secmem::harden_process();
     let args = Args::parse();
+    #[cfg(windows)]
+    if args.detach {
+        return detach();
+    }
     let data_dir = args.data_dir.unwrap_or_else(commx_core::default_data_dir);
     private_dir(&data_dir)?;
-    let sock_path = args.socket.unwrap_or_else(|| data_dir.join("commxd.sock"));
-    // Create a missing parent privately, but never chmod an existing directory
-    // (it might be /tmp). The socket itself is 0600 and peer-UID checked.
-    if let Some(parent) = sock_path.parent().filter(|p| !p.as_os_str().is_empty() && !p.exists()) {
+    let endpoint = args.socket.clone().unwrap_or_else(|| local_ipc::default_endpoint(&data_dir));
+    // Create a missing socket parent privately, but never chmod an existing
+    // directory (it might be /tmp). The socket itself is 0600 and peer-UID checked.
+    #[cfg(unix)]
+    if let Some(parent) = Path::new(&endpoint).parent().filter(|p| !p.as_os_str().is_empty() && !p.exists()) {
         private_dir(parent)?;
     }
-    let ipc = bind_socket(&sock_path)?;
+    let ipc = local_ipc::Listener::bind(&endpoint).with_context(|| format!("control endpoint {endpoint}"))?;
     files::purge_orphans(&data_dir);
 
     // In Tor mode only tor itself may reach us, so listen on loopback.
@@ -124,7 +164,7 @@ async fn main() -> Result<()> {
     };
 
     let shared: Shared = Arc::new(Mutex::new(Daemon::new(data_dir, transport.clone(), !args.no_keep_awake)));
-    eprintln!("commxd up: {} · control socket {}", transport.label(), sock_path.display());
+    eprintln!("commxd up: {} · control {endpoint}", transport.label());
 
     {
         let (shared, transport) = (shared.clone(), transport.clone());
@@ -151,14 +191,9 @@ async fn main() -> Result<()> {
         });
     }
 
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
-    }
+    shutdown_signal().await?;
     // Going down is a node drop: take our rooms with us, loudly.
     lock(&shared).nuke_all("node shut down");
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let _ = std::fs::remove_file(&sock_path);
     Ok(())
 }

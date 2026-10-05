@@ -1,11 +1,46 @@
 //! Keep the machine awake while rooms are live, and notice when it slept anyway.
 
+#[cfg(not(windows))]
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
+/// Something holding the machine awake; released on drop/kill.
+enum Inhibitor {
+    /// caffeinate / systemd-inhibit
+    #[cfg(not(windows))]
+    Child(Child),
+    /// Windows: SetThreadExecutionState is per-thread, so a dedicated thread
+    /// holds it until told to stop.
+    #[cfg(windows)]
+    Thread(std::sync::mpsc::Sender<()>),
+}
+
+impl Inhibitor {
+    fn alive(&mut self) -> bool {
+        match self {
+            #[cfg(not(windows))]
+            Inhibitor::Child(c) => matches!(c.try_wait(), Ok(None)),
+            #[cfg(windows)]
+            Inhibitor::Thread(_) => true,
+        }
+    }
+
+    fn release(self) {
+        match self {
+            #[cfg(not(windows))]
+            Inhibitor::Child(mut c) => {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            #[cfg(windows)]
+            Inhibitor::Thread(stop) => drop(stop),
+        }
+    }
+}
+
 pub struct Power {
     enabled: bool,
-    child: Option<Child>,
+    child: Option<Inhibitor>,
     last_mono: Instant,
     last_wall: SystemTime,
     battery: Option<(Instant, bool)>,
@@ -37,7 +72,7 @@ impl Power {
     /// Hold the sleep inhibitor iff some room is live.
     pub fn set_active(&mut self, active: bool) {
         if let Some(c) = &mut self.child {
-            if !matches!(c.try_wait(), Ok(None)) {
+            if !c.alive() {
                 self.child = None;
             }
         }
@@ -49,9 +84,8 @@ impl Power {
     }
 
     fn release(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
+        if let Some(c) = self.child.take() {
+            c.release();
         }
     }
 
@@ -88,6 +122,14 @@ impl Power {
                 return v;
             }
         }
+        #[cfg(windows)]
+        let v = {
+            use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+            let mut st: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+            let ok = unsafe { GetSystemPowerStatus(&mut st) } != 0;
+            ok && st.ACLineStatus == 0
+        };
+        #[cfg(not(windows))]
         let v = cfg!(target_os = "macos")
             && Command::new("pmset")
                 .args(["-g", "batt"])
@@ -105,7 +147,24 @@ impl Drop for Power {
     }
 }
 
-fn spawn_inhibitor() -> Option<Child> {
+#[cfg(windows)]
+fn spawn_inhibitor() -> Option<Inhibitor> {
+    use windows_sys::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_SYSTEM_REQUIRED};
+    let (stop, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::Builder::new()
+        .name("commx-keepawake".into())
+        .spawn(move || {
+            unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) };
+            // Blocks until the sender is dropped.
+            let _ = rx.recv();
+            unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+        })
+        .ok()?;
+    Some(Inhibitor::Thread(stop))
+}
+
+#[cfg(not(windows))]
+fn spawn_inhibitor() -> Option<Inhibitor> {
     let pid = std::process::id().to_string();
     let mut cmd = if cfg!(target_os = "macos") {
         // -i idle sleep, -s system sleep on AC, -w exit when we exit.
@@ -127,7 +186,7 @@ fn spawn_inhibitor() -> Option<Child> {
     } else {
         return None;
     };
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().ok()
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().ok().map(Inhibitor::Child)
 }
 
 #[cfg(test)]

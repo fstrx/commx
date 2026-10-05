@@ -9,7 +9,7 @@ use commx_core::{keystore, parse_room_id, room_id_hex, RoomId};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use zeroize::Zeroizing;
-use tokio::net::{UnixListener, UnixStream};
+use commx_core::local_ipc::{Listener, Reader, Writer};
 use tokio::sync::mpsc;
 
 use crate::files::FileState;
@@ -19,20 +19,15 @@ use crate::transport::Net;
 
 const MAX_LINE: usize = 64 * 1024;
 
-pub async fn serve(shared: Shared, transport: Arc<Net>, listener: UnixListener) {
-    let uid = unsafe { libc::getuid() };
+pub async fn serve(shared: Shared, transport: Arc<Net>, mut listener: Listener) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else { continue };
-        match stream.peer_cred() {
-            Ok(c) if c.uid() == uid => {}
-            _ => continue,
-        }
-        tokio::spawn(client(shared.clone(), transport.clone(), stream));
+        // Listener only yields same-user clients.
+        let Ok((r, w)) = listener.accept().await else { continue };
+        tokio::spawn(client(shared.clone(), transport.clone(), r, w));
     }
 }
 
-async fn client(shared: Shared, transport: Arc<Net>, stream: UnixStream) {
-    let (r, mut w) = stream.into_split();
+async fn client(shared: Shared, transport: Arc<Net>, r: Reader, mut w: Writer) {
     let (tx, mut rx) = mpsc::unbounded_channel::<IpcEvent>();
     let mut sub = lock(&shared).events.subscribe();
 

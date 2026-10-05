@@ -29,7 +29,11 @@ fn name_color(name: &str) -> Color {
 fn hhmm(ts_min: u64) -> String {
     let t = (ts_min * 60) as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+    #[cfg(unix)]
+    let ok = !unsafe { libc::localtime_r(&t, &mut tm) }.is_null();
+    #[cfg(windows)]
+    let ok = unsafe { libc::localtime_s(&mut tm, &t) } == 0;
+    if !ok {
         return "--:--".into();
     }
     format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)

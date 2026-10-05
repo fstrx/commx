@@ -18,6 +18,9 @@ postcard.workspace = true
 blake3.workspace = true
 zeroize.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
 commx-core.workspace = true
 serde_json.workspace = true

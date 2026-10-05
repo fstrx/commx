@@ -1,3 +1,6 @@
+// Drives daemons over unix sockets and uses SIGKILL/SIGSTOP.
+#![cfg(unix)]
+
 //! End-to-end: real commxd processes on localhost, driven over their control
 //! sockets. "Killing a node" is a real SIGKILL / SIGSTOP.
 
