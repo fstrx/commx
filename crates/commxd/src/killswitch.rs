@@ -183,6 +183,11 @@ impl Daemon {
                 room.send_all(&WireMsg::Heartbeat);
                 room.last_hb = now;
             }
+            if let Role::Member { host } = &mut room.role {
+                if let Some(u) = &mut host.udp {
+                    u.maybe_ping();
+                }
+            }
             match &room.role {
                 Role::Host { peers } => {
                     for (pk, p) in peers {

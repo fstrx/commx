@@ -14,6 +14,7 @@ mod net;
 mod power;
 mod state;
 mod transport;
+mod udp;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -56,6 +57,9 @@ struct Args {
     /// tor executable to launch in --tor mode.
     #[arg(long, default_value = "tor")]
     tor_bin: String,
+    /// Don't use the UDP voice fast path (e.g. UDP is blocked); calls use TCP.
+    #[arg(long)]
+    no_udp: bool,
     /// Windows: relaunch in the background with no console window.
     #[cfg(windows)]
     #[arg(long)]
@@ -165,6 +169,13 @@ async fn main() -> Result<()> {
     };
 
     let shared: Shared = Arc::new(Mutex::new(Daemon::new(data_dir, transport.clone(), !args.no_keep_awake)));
+    // Voice fast path, direct mode only: Tor mode must never open UDP.
+    if !args.tor && !args.no_udp {
+        match tokio::net::UdpSocket::bind(bound).await {
+            Ok(sock) => lock(&shared).udp_out = Some(udp::start(shared.clone(), sock)),
+            Err(e) => eprintln!("udp {bound} unavailable ({e}); voice will use tcp"),
+        }
+    }
     eprintln!("commxd up: {} · control {endpoint}", transport.label());
 
     {

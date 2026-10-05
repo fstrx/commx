@@ -15,6 +15,8 @@ It runs on macOS, Linux and Windows. Android is planned.
 
 ### macOS / Linux
 
+Building from source needs Rust and `cmake` (for the bundled Opus codec). On Linux you also need ALSA headers, e.g. `apt install cmake libasound2-dev`.
+
 ```sh
 cargo install --path crates/commxd
 cargo install --path crates/commx
@@ -92,7 +94,12 @@ Each room chooses its kill mode when it's created. Every member enforces the hos
   - The encoder runs in hard CBR and every frame is padded to the same size, so packet sizes can't leak words.
   - You send continuously while in a call, silence and mute included, so nobody can tell *when* you talk.
   - Cost: about 30 kb/s per participant.
-- **Tor.** Calls work in Tor mode, with roughly walkie-talkie latency (0.5–1.5 s). The jitter buffer adapts and Opus conceals lost frames. Direct TCP on a LAN or VPN gives near-real-time calls.
+- **Tor.** Calls work in Tor mode, with roughly walkie-talkie latency (0.5–1.5 s). The jitter buffer adapts and Opus conceals lost frames. Tor mode never opens a UDP socket.
+- **Direct mode: UDP fast path.**
+  - Voice goes over UDP on the same port as TCP. Each connection's UDP traffic is authenticated with keys derived from its Noise handshake, and the host only ever answers authenticated packets.
+  - If UDP is blocked, calls fall back to TCP automatically. Pass `--no-udp` to disable UDP entirely.
+  - The call header shows the active path: `udp`, `tcp` or `tor`.
+  - If you host behind a router, forward UDP 4700 as well as TCP.
 - **Microphone permission.** Audio runs in the `commx` TUI, so your OS asks for microphone permission for your terminal app. The daemon holds the keys.
 - **Headphones.** Use them. There's no echo cancellation yet.
 

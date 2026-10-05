@@ -24,6 +24,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit};
 
 use crate::files::hash_file;
+use crate::udp::UdpPath;
 use crate::state::{
     lock, Followup, Lanes, Peer, PeerKind, Role, Room, Shared, BULK_QUEUE, MAX_LINES, MEDIA_QUEUE, PEER_QUEUE,
 };
@@ -134,8 +135,17 @@ pub async fn handle_inbound(
     let tx = lanes.ctl.clone();
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let sign_pk = member.id.sign_pk;
-    let peer = Peer::new(lanes, cancel_tx);
-    let res = lock(&shared).admit(room_id, token, member, &sig, &conn.handshake_hash, peer);
+    let res = {
+        let mut d = lock(&shared);
+        let udp = d.udp_out.clone().map(|out| UdpPath::new(&conn.handshake_hash, None, out));
+        let udp_id = udp.as_ref().map(|u| u.id);
+        let peer = Peer::new(lanes, cancel_tx, udp);
+        let res = d.admit(room_id, token, member, &sig, &conn.handshake_hash, peer);
+        if let (Ok(()), Some(id)) = (&res, udp_id) {
+            d.udp_index.insert(id, (room_id, PeerKind::Member(sign_pk)));
+        }
+        res
+    };
     if let Err(reason) = &res {
         let _ = tx.try_send(WireMsg::JoinDenied { reason: reason.clone() });
     }
@@ -190,6 +200,8 @@ pub async fn join(shared: Shared, transport: Arc<Net>, code: &str) -> Result<Roo
     }
     let key = RoomKey::from_bytes(&open_sealed(&me, &sealed_key).map_err(|_| anyhow!("can't open room key"))?)?;
 
+    // The host's UDP port is its TCP port (same advertised address).
+    let host_udp = tokio::net::lookup_host(&invite.addr).await.ok().and_then(|mut a| a.next());
     let (lanes, rxs) = lanes();
     let (cancel_tx, cancel_rx) = oneshot::channel();
     // Everything the host told us about the room is displayed; scrub it.
@@ -211,7 +223,13 @@ pub async fn join(shared: Shared, transport: Arc<Net>, code: &str) -> Result<Roo
             keys: HashMap::from([(epoch, key)]),
             epoch,
             lines: SealedLog::new(MAX_LINES),
-            role: Role::Member { host: Peer::new(lanes, cancel_tx) },
+            role: Role::Member {
+                host: Peer::new(
+                    lanes,
+                    cancel_tx,
+                    d.udp_out.clone().map(|out| UdpPath::new(&conn.handshake_hash, host_udp, out)),
+                ),
+            },
             last_hb: Instant::now(),
             addr: String::new(),
             onion: None,
@@ -219,6 +237,7 @@ pub async fn join(shared: Shared, transport: Arc<Net>, code: &str) -> Result<Roo
             next_file_no: 0,
             call: None,
             data_dir: d.data_dir.clone(),
+            over_tor: d.net.is_tor(),
         };
         room.system(
             &ev,
@@ -231,6 +250,9 @@ pub async fn join(shared: Shared, transport: Arc<Net>, code: &str) -> Result<Roo
             ),
         );
         d.emit(IpcEvent::Room { room: room.summary() });
+        if let Role::Member { host: Peer { udp: Some(u), .. } } = &room.role {
+            d.udp_index.insert(u.id, (invite.room_id, PeerKind::Host));
+        }
         d.rooms.insert(invite.room_id, room);
         d.refresh_power();
     }

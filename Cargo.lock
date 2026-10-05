@@ -417,6 +417,7 @@ dependencies = [
  "libc",
  "postcard",
  "rand",
+ "serde",
  "serde_json",
  "snow",
  "tokio",

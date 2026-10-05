@@ -25,6 +25,7 @@ use crate::call::Call;
 use crate::files::{BlobReader, FileEntry};
 use crate::power::Power;
 use crate::transport::Net;
+use crate::udp::{Outbox, UdpPath};
 
 pub type Shared = Arc<Mutex<Daemon>>;
 
@@ -133,11 +134,13 @@ pub struct Peer {
     overflowed: AtomicBool,
     tokens: f64,
     refilled: Instant,
+    /// UDP fast path for voice (direct-TCP mode only).
+    pub udp: Option<UdpPath>,
     _cancel: oneshot::Sender<()>,
 }
 
 impl Peer {
-    pub fn new(lanes: Lanes, cancel: oneshot::Sender<()>) -> Self {
+    pub fn new(lanes: Lanes, cancel: oneshot::Sender<()>, udp: Option<UdpPath>) -> Self {
         let Lanes { ctl: tx, bulk, media } = lanes;
         Self {
             tx,
@@ -147,6 +150,7 @@ impl Peer {
             overflowed: AtomicBool::new(false),
             tokens: SUBMIT_BURST,
             refilled: Instant::now(),
+            udp,
             _cancel: cancel,
         }
     }
@@ -159,8 +163,20 @@ impl Peer {
         }
     }
 
+    /// Voice: UDP when that path is live, else the TCP media lane.
     pub fn send_media(&self, msg: WireMsg) {
+        if self.udp.as_ref().is_some_and(|u| u.send_voice(&msg)) {
+            return;
+        }
         let _ = self.media.try_send(msg);
+    }
+
+    /// Voice path in use: "udp" when the fast path is live, else "tcp".
+    pub fn link(&self) -> &'static str {
+        match &self.udp {
+            Some(u) if u.fresh() => "udp",
+            _ => "tcp",
+        }
     }
 
     pub fn bulk(&self) -> mpsc::Sender<WireMsg> {
@@ -228,6 +244,7 @@ pub struct Room {
     pub data_dir: PathBuf,
     /// At most one call per room; dropping it wipes the call key.
     pub call: Option<Call>,
+    pub over_tor: bool,
 }
 
 /// Work the connection task does after releasing the lock.
@@ -255,6 +272,14 @@ impl Room {
             alias: self.me.name.clone(),
             host_fp: self.host.id.fingerprint(),
             members: self.members.iter().map(|m| m.name.clone()).collect(),
+            link: match &self.role {
+                _ if self.over_tor => "tor".into(),
+                Role::Member { host } => host.link().to_string(),
+                Role::Host { peers } => {
+                    let up = peers.values().filter(|p| p.link() == "udp").count();
+                    format!("udp {up}/{}", peers.len())
+                }
+            },
         }
     }
 
@@ -537,6 +562,10 @@ pub struct Daemon {
     pub active: Option<usize>,
     pub rooms: HashMap<RoomId, Room>,
     pub invites: HashMap<[u8; 16], PendingInvite>,
+    /// UDP path id → which connection it belongs to.
+    pub udp_index: HashMap<[u8; 8], (RoomId, PeerKind)>,
+    /// Set in direct-TCP mode once the UDP socket is up.
+    pub udp_out: Option<Outbox>,
     pub events: Events,
     pub power: Power,
 }
@@ -550,6 +579,8 @@ impl Daemon {
             active: None,
             rooms: HashMap::new(),
             invites: HashMap::new(),
+            udp_index: HashMap::new(),
+            udp_out: None,
             events: Events::new(),
             power: Power::new(keep_awake),
         }
@@ -649,6 +680,7 @@ impl Daemon {
             next_file_no: 0,
             call: None,
             data_dir: self.data_dir.clone(),
+            over_tor: self.net.is_tor(),
         };
         room.keys.insert(0, RoomKey::generate());
         let ev = self.events.clone();

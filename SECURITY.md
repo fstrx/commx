@@ -38,6 +38,11 @@ Findings from reviewing the MVP, all fixed in commit `5a48646` unless noted. Reg
 - **Invites are bearer tokens.** They're single use and last 10 minutes, but anyone who intercepts one first can join. Check the fingerprints shown on join.
 - **No reconnect.** A real disconnect is a drop, by design.
 - **Voice frames aren't signed per sender.** They're authenticated as "someone holding the call key". A malicious participant, or the host, could inject audio attributed to someone else. Chat messages and files *are* signed. Per-frame signatures would roughly double call bandwidth.
+- **UDP fast path (direct mode only).**
+  - Each connection's UDP datagrams are encrypted and authenticated with a key derived from its Noise handshake hash.
+  - Unauthenticated datagrams get no reply, and ping and pong are the same size, so the socket can't be used for amplification or aimed at third parties.
+  - The host learns a member's UDP address only from that member's authenticated pings.
+  - UDP is never used in Tor mode.
 - **The host relays every call frame.** As a room member it can listen if it joins, and it sees who's in the call. Frame sizes and timing reveal nothing about speech.
 - **Windows is compile-checked here and tested in CI,** but hasn't had hands-on testing yet.
 - **Tor mode stores tor's consensus/guard cache** in `<data-dir>/tor`. That reveals commx used Tor, but nothing about rooms.

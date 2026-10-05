@@ -42,6 +42,9 @@ pub struct RoomSummary {
     pub alias: String,
     pub host_fp: String,
     pub members: Vec<String>,
+    /// Voice transport: "udp", "tcp", "tor", or "udp n/m" when hosting.
+    #[serde(default)]
+    pub link: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

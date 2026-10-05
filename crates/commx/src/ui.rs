@@ -127,7 +127,7 @@ fn room(f: &mut Frame, app: &App, area: Rect) {
                 (false, _) => " · /call to join",
             };
             t.spans.push(Span::styled(
-                format!("📞 {}{status} ", c.participants.join(", ")),
+                format!("📞 {}{status} ({}) ", c.participants.join(", "), r.link),
                 Style::default().fg(ACCENT).bold(),
             ));
             t

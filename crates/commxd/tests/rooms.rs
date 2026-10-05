@@ -422,3 +422,61 @@ fn call_routes_voice_only_to_participants() {
     a.req(json!({"op": "hangup", "room_id": room}));
     c.expect_system("call ended");
 }
+
+fn wait_link(n: &mut Node, room: &str, want: &str) {
+    let started = Instant::now();
+    loop {
+        n.req(json!({"op": "status"}));
+        let v = n.expect("status", 5, |v| v["ev"] == "status");
+        let link = v["rooms"].as_array().unwrap().iter().find(|r| r["room_id"] == room).unwrap()["link"].clone();
+        if link == want {
+            return;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "link stuck at {link}, wanted {want}");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+fn voice_both_ways(a: &mut Node, b: &mut Node, room: &str) {
+    a.req(json!({"op": "call", "room_id": room}));
+    b.expect_system("alice started a call");
+    b.req(json!({"op": "call", "room_id": room}));
+    a.expect_system("bob joined the call");
+    for i in 0..20u8 {
+        a.req(json!({"op": "voice_out", "room_id": room, "opus": hex::encode([i; 60])}));
+        b.req(json!({"op": "voice_out", "room_id": room, "opus": hex::encode([i ^ 0xff; 60])}));
+        // Real clients emit one frame per 20 ms; the media lane drops bursts by design.
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for i in 0..20u8 {
+        b.expect("voice a→b", 5, |v| v["ev"] == "voice_in" && v["opus"] == hex::encode([i; 60]));
+        a.expect("voice b→a", 5, |v| v["ev"] == "voice_in" && v["opus"] == hex::encode([i ^ 0xff; 60]));
+    }
+}
+
+#[test]
+fn voice_uses_udp_fast_path_when_available() {
+    let (mut a, mut b) = (Node::spawn("u-a"), Node::spawn("u-b"));
+    a.alias("alice");
+    b.alias("bob");
+    let (room, code) = a.room("udp", "HostOnly", 15, false);
+    b.join(&code);
+    wait_link(&mut b, &room, "udp");
+    wait_link(&mut a, &room, "udp 1/1");
+    voice_both_ways(&mut a, &mut b, &room);
+}
+
+#[test]
+fn voice_falls_back_to_tcp_without_udp() {
+    let dir = std::env::temp_dir().join(format!("cx-{}-nu-a", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut a = Node::spawn_with(dir, &["--no-udp"]);
+    let mut b = Node::spawn("nu-b");
+    a.alias("alice");
+    b.alias("bob");
+    let (room, code) = a.room("tcp", "HostOnly", 15, false);
+    b.join(&code);
+    std::thread::sleep(Duration::from_secs(2));
+    wait_link(&mut b, &room, "tcp");
+    voice_both_ways(&mut a, &mut b, &room);
+}
