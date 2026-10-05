@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "commx"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "commx-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "commxd"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "blake3",
