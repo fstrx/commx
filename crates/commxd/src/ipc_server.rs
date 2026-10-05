@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Result};
 use commx_core::identity::Identity;
 use commx_core::ipc::{IpcEvent, IpcRequest};
+use commx_core::text::valid_name;
 use commx_core::{keystore, parse_room_id, room_id_hex, RoomId};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -106,8 +107,8 @@ async fn handle(
         }
         IpcRequest::AliasNew { name, ephemeral, passphrase } => {
             let name = name.trim().to_string();
-            if name.is_empty() || name.len() > 32 || name.chars().any(char::is_whitespace) {
-                return Err(anyhow!("alias must be 1-32 chars, no spaces"));
+            if !valid_name(&name, 32) || name.contains(char::is_whitespace) {
+                return Err(anyhow!("alias must be 1-32 printable chars, no spaces"));
             }
             if lock(shared).aliases.iter().any(|a| a.id.name == name) {
                 return Err(anyhow!("alias '{name}' already loaded"));

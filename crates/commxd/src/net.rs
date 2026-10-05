@@ -8,20 +8,21 @@ use commx_core::invite::Invite;
 use commx_core::ipc::IpcEvent;
 use commx_core::room::MemberInfo;
 use commx_core::wire::{channel_binding, WireMsg};
+use commx_core::text::clean;
 use commx_core::RoomId;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit};
 
-use crate::state::{lock, Peer, PeerKind, Role, Room, Shared};
+use crate::state::{lock, Peer, PeerKind, Role, Room, Shared, PEER_QUEUE};
 use crate::transport::tcp::TcpTransport;
 use crate::transport::{SecureReader, SecureWriter, Transport};
 
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
-async fn writer_task(mut rx: mpsc::UnboundedReceiver<WireMsg>, mut w: SecureWriter) {
+async fn writer_task(mut rx: mpsc::Receiver<WireMsg>, mut w: SecureWriter) {
     while let Some(msg) = rx.recv().await {
         if w.send(&msg).await.is_err() {
             break;
@@ -52,7 +53,15 @@ async fn reader_loop(
 }
 
 /// Host side: someone dialed us with an invite.
-pub async fn handle_inbound(shared: Shared, transport: Arc<TcpTransport>, stream: TcpStream) {
+///
+/// `permit` bounds how many unauthenticated connections exist at once; it's
+/// released as soon as the join is decided.
+pub async fn handle_inbound(
+    shared: Shared,
+    transport: Arc<TcpTransport>,
+    stream: TcpStream,
+    permit: OwnedSemaphorePermit,
+) {
     let Ok(conn) = transport.respond(stream).await else { return };
     let mut reader = conn.reader;
     let Ok(Ok(WireMsg::JoinReq { room_id, token, member, sig })) =
@@ -60,15 +69,16 @@ pub async fn handle_inbound(shared: Shared, transport: Arc<TcpTransport>, stream
     else {
         return;
     };
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(PEER_QUEUE);
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let sign_pk = member.id.sign_pk;
     let peer = Peer::new(tx.clone(), cancel_tx);
     let res = lock(&shared).admit(room_id, token, member, &sig, &conn.handshake_hash, peer);
     if let Err(reason) = &res {
-        let _ = tx.send(WireMsg::JoinDenied { reason: reason.clone() });
+        let _ = tx.try_send(WireMsg::JoinDenied { reason: reason.clone() });
     }
     drop(tx);
+    drop(permit);
     tokio::spawn(writer_task(rx, conn.writer));
     if res.is_ok() {
         reader_loop(shared, reader, cancel_rx, room_id, PeerKind::Member(sign_pk)).await;
@@ -118,8 +128,14 @@ pub async fn join(shared: Shared, transport: Arc<TcpTransport>, code: &str) -> R
     }
     let key = RoomKey::from_bytes(&open_sealed(&me, &sealed_key).map_err(|_| anyhow!("can't open room key"))?)?;
 
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(PEER_QUEUE);
     let (cancel_tx, cancel_rx) = oneshot::channel();
+    // Everything the host told us about the room is displayed; scrub it.
+    let mut cfg = cfg;
+    cfg.name = clean(&cfg.name);
+    let members: Vec<MemberInfo> =
+        members.into_iter().map(|m| MemberInfo { name: clean(&m.name), id: m.id }).collect();
+    let host = MemberInfo { name: clean(&host.name), id: host.id };
     {
         let mut d = lock(&shared);
         let ev = d.events.clone();

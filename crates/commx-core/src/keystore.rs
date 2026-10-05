@@ -1,6 +1,8 @@
-//! Alias files at rest: `CXK1 | salt(16) | nonce(24) | XChaCha20-Poly1305(postcard(IdentitySecret))`,
-//! keyed with Argon2id(passphrase, salt). File names are random so they reveal
-//! nothing about the alias.
+//! Alias files at rest:
+//! `CXK2 | m_kib(4) | t(4) | p(4) | salt(16) | nonce(24) | XChaCha20-Poly1305(postcard(IdentitySecret))`,
+//! keyed with Argon2id(passphrase, salt, m, t, p). Parameters are stored so they
+//! can be raised later without breaking old files. File names are random so
+//! they reveal nothing about the alias.
 
 use anyhow::{anyhow, bail, Result};
 use rand::{rngs::OsRng, RngCore};
@@ -10,11 +12,20 @@ use zeroize::Zeroizing;
 use crate::crypto::{aead_decrypt, aead_encrypt};
 use crate::identity::{Identity, IdentitySecret};
 
-const MAGIC: &[u8; 4] = b"CXK1";
+const MAGIC: &[u8; 4] = b"CXK2";
+const HEADER: usize = 4 + 12 + 16 + 24;
+/// 64 MiB, 3 passes: well above OWASP's floor, ~0.3s on a laptop.
+const M_KIB: u32 = 64 * 1024;
+const T_COST: u32 = 3;
+const P_COST: u32 = 1;
 
-fn derive(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+fn derive(passphrase: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<Zeroizing<[u8; 32]>> {
+    if !(8 * 1024..=1024 * 1024).contains(&m) || !(1..=16).contains(&t) || !(1..=8).contains(&p) {
+        bail!("alias file has unreasonable KDF parameters");
+    }
+    let params = argon2::Params::new(m, t, p, Some(32)).map_err(|e| anyhow!("argon2: {e}"))?;
     let mut out = Zeroizing::new([0u8; 32]);
-    argon2::Argon2::default()
+    argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
         .hash_password_into(passphrase.as_bytes(), salt, out.as_mut())
         .map_err(|e| anyhow!("argon2: {e}"))?;
     Ok(out)
@@ -23,11 +34,16 @@ fn derive(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
 pub fn seal_identity(id: &Identity, passphrase: &str) -> Result<Vec<u8>> {
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
-    let key = derive(passphrase, &salt)?;
+    let key = derive(passphrase, &salt, M_KIB, T_COST, P_COST)?;
     let plain = Zeroizing::new(postcard::to_allocvec(&id.to_secret())?);
-    let (nonce, ct) = aead_encrypt(&key, &plain, MAGIC)?;
-    let mut out = Vec::with_capacity(4 + 16 + 24 + ct.len());
-    out.extend_from_slice(MAGIC);
+    let mut header = Vec::with_capacity(HEADER);
+    header.extend_from_slice(MAGIC);
+    for v in [M_KIB, T_COST, P_COST] {
+        header.extend_from_slice(&v.to_le_bytes());
+    }
+    // The header is authenticated: tampering with params or magic fails decryption.
+    let (nonce, ct) = aead_encrypt(&key, &plain, &header)?;
+    let mut out = header;
     out.extend_from_slice(&salt);
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ct);
@@ -35,12 +51,14 @@ pub fn seal_identity(id: &Identity, passphrase: &str) -> Result<Vec<u8>> {
 }
 
 pub fn open_identity(bytes: &[u8], passphrase: &str) -> Result<Identity> {
-    if bytes.len() < 44 || &bytes[..4] != MAGIC {
+    if bytes.len() < HEADER || &bytes[..4] != MAGIC {
         bail!("not a commx alias file");
     }
-    let key = derive(passphrase, &bytes[4..20])?;
-    let nonce: [u8; 24] = bytes[20..44].try_into()?;
-    let plain = aead_decrypt(&key, &nonce, &bytes[44..], MAGIC).map_err(|_| anyhow!("wrong passphrase"))?;
+    let word = |i: usize| u32::from_le_bytes(bytes[4 + i * 4..8 + i * 4].try_into().unwrap());
+    let key = derive(passphrase, &bytes[16..32], word(0), word(1), word(2))?;
+    let nonce: [u8; 24] = bytes[32..56].try_into()?;
+    let plain =
+        aead_decrypt(&key, &nonce, &bytes[HEADER..], &bytes[..16]).map_err(|_| anyhow!("wrong passphrase"))?;
     let secret: IdentitySecret = postcard::from_bytes(&plain)?;
     Ok(Identity::from_secret(&secret))
 }

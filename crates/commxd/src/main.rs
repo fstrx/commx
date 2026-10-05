@@ -15,6 +15,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, UnixListener};
+use tokio::sync::Semaphore;
+
+/// Connections allowed in the handshake/join phase at once.
+const MAX_PREAUTH: usize = 32;
 
 use state::{lock, Daemon, Shared};
 use transport::tcp::TcpTransport;
@@ -68,8 +72,12 @@ fn guess_ip() -> IpAddr {
 }
 
 fn bind_socket(path: &Path) -> Result<UnixListener> {
-    use std::os::unix::fs::PermissionsExt;
-    if path.exists() {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        // Only ever delete a stale socket, never some other file.
+        if !meta.file_type().is_socket() {
+            bail!("{} exists and is not a socket", path.display());
+        }
         if std::os::unix::net::UnixStream::connect(path).is_ok() {
             bail!("commxd already running on {}", path.display());
         }
@@ -87,7 +95,9 @@ async fn main() -> Result<()> {
     let data_dir = args.data_dir.unwrap_or_else(commx_core::default_data_dir);
     private_dir(&data_dir)?;
     let sock_path = args.socket.unwrap_or_else(|| data_dir.join("commxd.sock"));
-    if let Some(parent) = sock_path.parent() {
+    // Create a missing parent privately, but never chmod an existing directory
+    // (it might be /tmp). The socket itself is 0600 and peer-UID checked.
+    if let Some(parent) = sock_path.parent().filter(|p| !p.as_os_str().is_empty() && !p.exists()) {
         private_dir(parent)?;
     }
     let ipc = bind_socket(&sock_path)?;
@@ -105,10 +115,13 @@ async fn main() -> Result<()> {
 
     {
         let (shared, transport) = (shared.clone(), transport.clone());
+        let preauth = Arc::new(Semaphore::new(MAX_PREAUTH));
         tokio::spawn(async move {
             loop {
                 if let Ok(stream) = transport.accept(&tcp).await {
-                    tokio::spawn(net::handle_inbound(shared.clone(), transport.clone(), stream));
+                    // Shed load instead of queueing unauthenticated strangers.
+                    let Ok(permit) = preauth.clone().try_acquire_owned() else { continue };
+                    tokio::spawn(net::handle_inbound(shared.clone(), transport.clone(), stream, permit));
                 }
             }
         });

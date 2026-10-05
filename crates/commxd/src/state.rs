@@ -8,11 +8,13 @@ use commx_core::identity::{verify, Identity};
 use commx_core::invite::Invite;
 use commx_core::ipc::{AliasInfo, ChatLine, IpcEvent, RoomSummary};
 use commx_core::room::{KillMode, MemberInfo, RoomConfig, MIN_GRACE_SECS};
+use commx_core::text::{clean, valid_name};
 use commx_core::wire::{channel_binding, WireMsg};
 use commx_core::{room_id_hex, RoomId, MAX_TEXT_LEN};
 use rand::{rngs::OsRng, RngCore};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -35,21 +37,59 @@ pub struct AliasEntry {
     pub ephemeral: bool,
 }
 
+/// Outbound frames queued per connection before the peer counts as dead.
+pub const PEER_QUEUE: usize = 512;
+/// Member message rate limit: sustained per second, and burst.
+const SUBMIT_RATE: f64 = 5.0;
+const SUBMIT_BURST: f64 = 20.0;
+
 /// One live connection. Dropping it closes the channel: the writer drains and
 /// exits, and the dropped cancel sender stops the reader.
 pub struct Peer {
-    tx: mpsc::UnboundedSender<WireMsg>,
+    tx: mpsc::Sender<WireMsg>,
     pub last_seen: Instant,
+    overflowed: AtomicBool,
+    tokens: f64,
+    refilled: Instant,
     _cancel: oneshot::Sender<()>,
 }
 
 impl Peer {
-    pub fn new(tx: mpsc::UnboundedSender<WireMsg>, cancel: oneshot::Sender<()>) -> Self {
-        Self { tx, last_seen: Instant::now(), _cancel: cancel }
+    pub fn new(tx: mpsc::Sender<WireMsg>, cancel: oneshot::Sender<()>) -> Self {
+        Self {
+            tx,
+            last_seen: Instant::now(),
+            overflowed: AtomicBool::new(false),
+            tokens: SUBMIT_BURST,
+            refilled: Instant::now(),
+            _cancel: cancel,
+        }
     }
 
+    /// Never blocks. A peer that can't keep up is flagged and dropped on the
+    /// next tick instead of growing memory without bound.
     pub fn send(&self, msg: WireMsg) {
-        let _ = self.tx.send(msg);
+        if self.tx.try_send(msg).is_err() {
+            self.overflowed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn overflowed(&self) -> bool {
+        self.overflowed.load(Ordering::Relaxed)
+    }
+
+    /// Token bucket for member submissions.
+    fn allow_submit(&mut self) -> bool {
+        let now = Instant::now();
+        let refill = now.duration_since(self.refilled).as_secs_f64() * SUBMIT_RATE;
+        self.tokens = (self.tokens + refill).min(SUBMIT_BURST);
+        self.refilled = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -158,6 +198,14 @@ impl Room {
         }
     }
 
+    /// Host: rate-limit a member's submissions; floods are dropped silently.
+    pub fn allow_submit(&mut self, pk: &[u8; 32]) -> bool {
+        match &mut self.role {
+            Role::Host { peers } => peers.get_mut(pk).is_some_and(Peer::allow_submit),
+            Role::Member { .. } => false,
+        }
+    }
+
     fn set_key(&mut self, epoch: u32, key: RoomKey) {
         self.keys.insert(epoch, key);
         self.epoch = epoch;
@@ -181,7 +229,7 @@ impl Room {
         match &p.body {
             Body::Msg { .. } => {
                 let from = self.name_of(&p.author).ok_or_else(|| anyhow!("message from non-member"))?;
-                let text = self.decrypt_msg(p)?;
+                let text = clean(&self.decrypt_msg(p)?);
                 self.push(ev, ChatLine { from, text, ts_min: p.ts_min, mine, system: false });
             }
             Body::KeyRotate { new_epoch, sealed } => {
@@ -375,8 +423,8 @@ impl Daemon {
     pub fn create_room(&mut self, name: &str, kill_mode: KillMode, grace_secs: u64, dm: bool) -> Result<RoomId> {
         let me = self.active_identity()?;
         let name = name.trim();
-        if name.is_empty() || name.len() > 48 {
-            bail!("room name must be 1-48 chars");
+        if !valid_name(name, 48) {
+            bail!("room name must be 1-48 printable chars");
         }
         let mut id = [0u8; 16];
         OsRng.fill_bytes(&mut id);
@@ -452,7 +500,7 @@ impl Daemon {
         if !verify(&member.id.sign_pk, &channel_binding(handshake_hash, "member"), sig) {
             return deny("bad identity proof");
         }
-        if member.name.trim().is_empty() || member.name.len() > 32 {
+        if !valid_name(&member.name, 32) || member.name.contains(char::is_whitespace) {
             return deny("bad alias name");
         }
         let ev = self.events.clone();
@@ -467,6 +515,10 @@ impl Daemon {
         }
         if room.members.iter().any(|m| m.id == member.id) {
             return deny("already a member");
+        }
+        // Names are display-only, but duplicates make impersonation trivial.
+        if room.members.iter().any(|m| m.name.eq_ignore_ascii_case(&member.name)) {
+            return deny("that alias name is taken in this room");
         }
         let sealed_key = match seal_to(&member.id.dh_pk, room.keys[&room.epoch].as_bytes()) {
             Ok(s) => s,

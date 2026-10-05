@@ -23,7 +23,9 @@ impl Daemon {
         room.touch(kind);
         let after = match (kind, msg) {
             (PeerKind::Member(pk), WireMsg::Submit(p)) => {
-                room.host_submit(&ev, pk, p);
+                if room.allow_submit(&pk) {
+                    room.host_submit(&ev, pk, p);
+                }
                 After::Nothing
             }
             (PeerKind::Member(_), WireMsg::Leave { .. }) => After::Gone("left"),
@@ -142,21 +144,26 @@ impl Daemon {
                 room.last_hb = now;
             }
             match &room.role {
-                Role::Host { peers } => gone.extend(
-                    peers
-                        .iter()
-                        .filter(|(_, p)| now.duration_since(p.last_seen) > grace)
-                        .map(|(pk, _)| (*id, PeerKind::Member(*pk))),
-                ),
+                Role::Host { peers } => {
+                    for (pk, p) in peers {
+                        if p.overflowed() {
+                            gone.push((*id, PeerKind::Member(*pk), "can't keep up"));
+                        } else if now.duration_since(p.last_seen) > grace {
+                            gone.push((*id, PeerKind::Member(*pk), "timed out"));
+                        }
+                    }
+                }
                 Role::Member { host } => {
-                    if now.duration_since(host.last_seen) > grace {
-                        gone.push((*id, PeerKind::Host));
+                    if host.overflowed() {
+                        gone.push((*id, PeerKind::Host, "can't keep up"));
+                    } else if now.duration_since(host.last_seen) > grace {
+                        gone.push((*id, PeerKind::Host, "timed out"));
                     }
                 }
             }
         }
-        for (id, kind) in gone {
-            self.peer_gone(id, kind, "timed out");
+        for (id, kind, why) in gone {
+            self.peer_gone(id, kind, why);
         }
 
         self.invites.retain(|_, i| i.expires > now);

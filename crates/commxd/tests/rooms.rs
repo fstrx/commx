@@ -250,3 +250,32 @@ fn persistent_alias_survives_restart_behind_passphrase() {
     assert_eq!(v["alias"], "ghost");
     assert_eq!(v["fingerprint"].as_str().unwrap(), fp);
 }
+
+#[test]
+fn duplicate_alias_name_is_refused() {
+    let (mut a, mut b, mut c) = (Node::spawn("dup-a"), Node::spawn("dup-b"), Node::spawn("dup-c"));
+    a.alias("alice");
+    b.alias("bob");
+    c.alias("Bob");
+    let (room, code) = a.room("r", "HostOnly", 15, false);
+    b.join(&code);
+    let code = a.invite(&room);
+    c.req(json!({"op": "join", "code": code}));
+    c.expect("name clash", 10, |v| v["ev"] == "error" && v["msg"].as_str().unwrap().contains("taken"));
+}
+
+#[test]
+fn member_flood_is_rate_limited() {
+    let (mut a, mut b) = (Node::spawn("fl-a"), Node::spawn("fl-b"));
+    a.alias("alice");
+    b.alias("bob");
+    let (room, code) = a.room("r", "HostOnly", 15, false);
+    b.join(&code);
+    for i in 0..100 {
+        b.send(&room, &format!("spam {i}"));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let got = a.rx.try_iter().filter(|v| v["ev"] == "line" && v["line"]["from"] == "bob").count();
+    // burst of 20 plus ~5/s refill over the send window
+    assert!((20..=35).contains(&got), "host accepted {got} of 100");
+}
