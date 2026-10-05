@@ -3,6 +3,7 @@
 
 use commx_core::ipc::{CallInfo, ChatLine, IpcEvent, IpcRequest, RoomSummary};
 use commx_core::secmem::SealedLog;
+use crate::voice::DeviceChoice;
 use std::collections::{HashMap, HashSet};
 
 const HISTORY: usize = 500;
@@ -31,6 +32,11 @@ fn default_download_dir() -> String {
         .and_then(|u| u.download_dir().map(|d| d.to_path_buf()).or_else(|| Some(u.home_dir().to_path_buf())))
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_else(|| ".".into())
+}
+
+enum CmdKind {
+    Mic,
+    Other,
 }
 
 /// Author tag for lines only this client shows (invite codes, file lists).
@@ -71,6 +77,19 @@ pub struct App {
     /// Call state per room, as reported by the daemon.
     pub calls: HashMap<String, CallInfo>,
     pub muted: bool,
+    /// Push-to-talk mode, and whether the talk key is currently down.
+    pub ptt: bool,
+    pub talking: bool,
+    /// Terminal reports key releases (hold-to-talk); otherwise Space toggles.
+    pub release_keys: bool,
+    /// Local loopback test is running.
+    pub echo: bool,
+    pub devices: DeviceChoice,
+    /// Last /devices listing, for resolving `/mic 2`.
+    device_lists: (Vec<String>, Vec<String>),
+    /// Live meters from the audio engine.
+    pub mic_level: f32,
+    pub speaking: Vec<String>,
 }
 
 impl App {
@@ -89,6 +108,14 @@ impl App {
             quit: false,
             calls: HashMap::new(),
             muted: false,
+            ptt: false,
+            talking: false,
+            release_keys: false,
+            echo: false,
+            devices: DeviceChoice::default(),
+            device_lists: (Vec::new(), Vec::new()),
+            mic_level: 0.0,
+            speaking: Vec::new(),
         };
         app.log("commx · end-to-end encrypted, memory-only chat. Nothing here touches disk.", false);
         app.log("Start: /alias new <name> --ephemeral  (or /unlock for saved aliases)", false);
@@ -96,6 +123,51 @@ impl App {
             app.log(*h, false);
         }
         app
+    }
+
+    /// Is our microphone actually sending sound (vs. silence frames)?
+    pub fn mic_open(&self) -> bool {
+        !self.muted && (!self.ptt || self.talking)
+    }
+
+    fn list_devices(&mut self) {
+        self.device_lists = crate::voice::list_devices();
+        let (mics, speakers) = self.device_lists.clone();
+        let (cur_mic, cur_speaker) = (self.devices.mic.clone(), self.devices.speaker.clone());
+        for (title, list, chosen) in [("microphones", mics, cur_mic), ("speakers", speakers, cur_speaker)] {
+            self.log(format!("{title}{}:", if chosen.is_none() { " (using system default)" } else { "" }), false);
+            if list.is_empty() {
+                self.log("  none found", true);
+            }
+            for (i, name) in list.iter().enumerate() {
+                let mark = if chosen.as_deref() == Some(name.as_str()) { "▸" } else { " " };
+                self.log(format!("{mark} {}. {name}", i + 1), false);
+            }
+        }
+    }
+
+    /// `2`, an exact name, a unique case-insensitive substring, or `default`.
+    fn resolve_device(&mut self, arg: &str, mic: bool) -> Result<Option<String>, String> {
+        if arg.eq_ignore_ascii_case("default") {
+            return Ok(None);
+        }
+        if self.device_lists.0.is_empty() && self.device_lists.1.is_empty() {
+            self.device_lists = crate::voice::list_devices();
+        }
+        let list = if mic { &self.device_lists.0 } else { &self.device_lists.1 };
+        if let Ok(n) = arg.parse::<usize>() {
+            return list.get(n.wrapping_sub(1)).cloned().map(Some).ok_or_else(|| format!("no device #{n} (see /devices)"));
+        }
+        if let Some(exact) = list.iter().find(|d| *d == arg) {
+            return Ok(Some(exact.clone()));
+        }
+        let lower = arg.to_lowercase();
+        let hits: Vec<&String> = list.iter().filter(|d| d.to_lowercase().contains(&lower)).collect();
+        match hits.as_slice() {
+            [one] => Ok(Some((*one).clone())),
+            [] => Err(format!("no device matching '{arg}' (see /devices)")),
+            _ => Err(format!("'{arg}' matches several devices; use its number from /devices")),
+        }
     }
 
     /// The room whose call we're in (at most one; the daemon allows one per room).
@@ -281,6 +353,7 @@ impl App {
                 return Vec::new();
             }
         };
+        let cmd_kind = if matches!(cmd, Command::Mic(_)) { CmdKind::Mic } else { CmdKind::Other };
         let room = self.current().map(|r| r.room_id.clone());
         let need_room = |s: &mut Self| {
             s.notify("select a room first (Tab)", true);
@@ -369,6 +442,49 @@ impl App {
                 self.notify(if self.muted { "microphone muted (still sending silence)" } else { "microphone on" }, false);
                 Vec::new()
             }
+            Command::Ptt => {
+                self.ptt = !self.ptt;
+                self.talking = false;
+                let how = if self.release_keys { "hold Space" } else { "press Space to start/stop" };
+                self.notify(
+                    if self.ptt { format!("push-to-talk on: {how} with an empty input") } else { "push-to-talk off: open mic".into() },
+                    false,
+                );
+                Vec::new()
+            }
+            Command::EchoTest => {
+                if !self.echo && self.call_room().is_some() {
+                    self.notify("hang up first; the echo test uses your mic and speakers", true);
+                    return Vec::new();
+                }
+                self.echo = !self.echo;
+                self.notify(
+                    if self.echo { "echo test: speak, you'll hear yourself ~1s later (headphones!) — /echotest to stop" } else { "echo test stopped" },
+                    false,
+                );
+                Vec::new()
+            }
+            Command::Devices => {
+                self.list_devices();
+                self.select(0);
+                Vec::new()
+            }
+            Command::Mic(arg) | Command::Speaker(arg) => {
+                let mic = matches!(cmd_kind, CmdKind::Mic);
+                match self.resolve_device(&arg, mic) {
+                    Ok(choice) => {
+                        let label = choice.clone().unwrap_or_else(|| "system default".into());
+                        if mic {
+                            self.devices.mic = choice;
+                        } else {
+                            self.devices.speaker = choice;
+                        }
+                        self.notify(format!("{} → {label}", if mic { "microphone" } else { "speakers" }), false);
+                    }
+                    Err(e) => self.notify(e, true),
+                }
+                Vec::new()
+            }
             Command::Nuke { all: true } => vec![IpcRequest::Nuke { room_id: None }],
             Command::Nuke { all: false } => match room {
                 Some(room_id) => vec![IpcRequest::Nuke { room_id: Some(room_id) }],
@@ -382,5 +498,34 @@ impl App {
                 None => need_room(self),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ptt_and_mute_gate_the_mic() {
+        let mut app = App::new();
+        assert!(app.mic_open());
+        app.ptt = true;
+        assert!(!app.mic_open(), "ptt idle");
+        app.talking = true;
+        assert!(app.mic_open(), "ptt held");
+        app.muted = true;
+        assert!(!app.mic_open(), "mute wins");
+    }
+
+    #[test]
+    fn resolves_devices_by_number_name_and_substring() {
+        let mut app = App::new();
+        app.device_lists = (vec!["MacBook Pro Microphone".into(), "USB Headset Mic".into()], vec!["AirPods".into()]);
+        assert_eq!(app.resolve_device("2", true).unwrap().as_deref(), Some("USB Headset Mic"));
+        assert_eq!(app.resolve_device("usb", true).unwrap().as_deref(), Some("USB Headset Mic"));
+        assert_eq!(app.resolve_device("default", true).unwrap(), None);
+        assert!(app.resolve_device("mic", true).is_err(), "ambiguous");
+        assert!(app.resolve_device("9", true).is_err());
+        assert_eq!(app.resolve_device("airpods", false).unwrap().as_deref(), Some("AirPods"));
     }
 }

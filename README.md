@@ -42,6 +42,8 @@ Tor mode needs a `tor` binary on your PATH. On macOS that's `brew install tor`; 
 /send ~/notes.pdf                   share a file (max 256 MiB)
 /files   /save 1 [path]             list files / export a decrypted copy
 /call    /hangup   /mute            start or join the room's voice call / leave / mute
+/ptt     /echotest                  push-to-talk (hold Space) / hear yourself through the codec
+/devices /mic 2  /speaker 1         list and pick audio devices
 /nuke    /nuke all                  destroy this room / everything
 ```
 
@@ -102,6 +104,13 @@ Each room chooses its kill mode when it's created. Every member enforces the hos
   - If you host behind a router, forward UDP 4700 as well as TCP.
 - **Microphone permission.** Audio runs in the `commx` TUI, so your OS asks for microphone permission for your terminal app. The daemon holds the keys.
 - **Headphones.** Use them. There's no echo cancellation yet.
+- **Testing alone.** `/echotest` runs your microphone through the whole receive path (Opus encode → jitter buffer → decode → mix → speakers) and plays you back about a second later. Use it to check devices and levels without anyone else.
+- **Push-to-talk.** `/ptt`, then hold Space while the input box is empty.
+  - Hold-to-talk needs a terminal that reports key releases. Windows Terminal does, and so do kitty, WezTerm, Ghostty, foot, and iTerm2 with CSI-u enabled.
+  - In other terminals, Space toggles talking on and off.
+  - Muting and push-to-talk still send silence frames, so they leak nothing.
+- **Speaking indicator.** The call header highlights whoever is talking. Each listener works this out from the audio it decodes, so nothing extra is sent. The status bar shows your own mic level.
+- **Devices.** `/devices` lists microphones and speakers; `/mic <n>` and `/speaker <n>` switch them, even mid-call. Device names never leave your machine.
 
 ## Memory hardening
 

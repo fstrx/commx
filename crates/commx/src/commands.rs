@@ -20,6 +20,11 @@ pub enum Command {
     Call,
     Hangup,
     Mute,
+    Ptt,
+    EchoTest,
+    Devices,
+    Mic(String),
+    Speaker(String),
     Status,
     Quit,
     Say(String),
@@ -40,6 +45,9 @@ pub const HELP: &[&str] = &[
     "/save <n> [path]                  export file #n decrypted (default: Downloads)",
     "/call                             start or join this room's voice call",
     "/hangup   /mute                   leave the call / toggle your microphone",
+    "/ptt                              push-to-talk: hold Space (empty input) to talk",
+    "/echotest                         hear yourself through the full codec path (solo test)",
+    "/devices  /mic <n>  /speaker <n>  list / pick audio devices (\"default\" resets)",
     "/nuke                             destroy this room (host: for everyone)",
     "/nuke all                         destroy everything, now",
     "/status   /help   /quit",
@@ -107,6 +115,12 @@ pub fn parse(input: &str) -> Result<Command, String> {
         ("/call" | "/vc", _) => Ok(Command::Call),
         ("/hangup" | "/leave", _) => Ok(Command::Hangup),
         ("/mute" | "/unmute", _) => Ok(Command::Mute),
+        ("/ptt", _) => Ok(Command::Ptt),
+        ("/echotest" | "/echo", _) => Ok(Command::EchoTest),
+        ("/devices", _) => Ok(Command::Devices),
+        ("/mic", arg) if !arg.is_empty() => Ok(Command::Mic(arg.join(" "))),
+        ("/speaker", arg) if !arg.is_empty() => Ok(Command::Speaker(arg.join(" "))),
+        ("/mic" | "/speaker", _) => usage("/mic <n|name|default>  (see /devices)"),
         ("/nuke", []) => Ok(Command::Nuke { all: false }),
         ("/nuke", ["all"]) => Ok(Command::Nuke { all: true }),
         ("/nuke", _) => usage("/nuke [all]"),
@@ -132,6 +146,8 @@ mod tests {
         assert_eq!(parse("/nuke all").unwrap(), Command::Nuke { all: true });
         assert_eq!(parse("/send ~/My Docs/a.pdf").unwrap(), Command::SendFile("~/My Docs/a.pdf".into()));
         assert_eq!(parse("/save #3").unwrap(), Command::Save { no: 3, dest: None });
+        assert_eq!(parse("/mic MacBook Pro Microphone").unwrap(), Command::Mic("MacBook Pro Microphone".into()));
+        assert!(parse("/speaker").is_err());
         assert_eq!(parse("/save 2 /tmp/x").unwrap(), Command::Save { no: 2, dest: Some("/tmp/x".into()) });
         assert!(parse("/room new").is_err());
         assert!(parse("/grace --x").is_err());

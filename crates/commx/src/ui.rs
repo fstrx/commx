@@ -121,15 +121,18 @@ fn room(f: &mut Frame, app: &App, area: Rect) {
     let title = match app.calls.get(&r.room_id) {
         Some(c) => {
             let mut t = title;
-            let status = match (c.joined, app.muted) {
-                (true, true) => " · in call, muted",
-                (true, false) => " · in call",
-                (false, _) => " · /call to join",
-            };
-            t.spans.push(Span::styled(
-                format!("📞 {}{status} ({}) ", c.participants.join(", "), r.link),
-                Style::default().fg(ACCENT).bold(),
-            ));
+            t.spans.push(Span::styled("📞 ", Style::default().fg(ACCENT).bold()));
+            for (i, p) in c.participants.iter().enumerate() {
+                let me = c.joined && *p == r.alias;
+                let talking = if me { app.mic_open() && app.mic_level > 0.02 } else { app.speaking.contains(p) };
+                if i > 0 {
+                    t.spans.push(Span::raw(", "));
+                }
+                let style = if talking { Style::default().fg(Color::Black).bg(ACCENT).bold() } else { Style::default().fg(ACCENT) };
+                t.spans.push(Span::styled(if talking { format!("● {p}") } else { p.clone() }, style));
+            }
+            let status = if c.joined { format!(" · in call ({}) ", r.link) } else { " · /call to join ".into() };
+            t.spans.push(Span::styled(status, Style::default().fg(DIM)));
             t
         }
         None => title,
@@ -210,6 +213,23 @@ fn status_bar(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(format!(" {} ", s.fingerprint.as_deref().unwrap_or("-")), Style::default().fg(DIM)),
         Span::styled(format!("· {} · {} ", s.listen, s.power), Style::default().fg(DIM)),
     ];
+    if app.call_room().is_some() || app.echo {
+        // dBFS → 0..8 bars
+        let db = 20.0 * app.mic_level.max(1e-6).log10();
+        let bars = (((db + 50.0) / 6.0).clamp(0.0, 8.0)) as usize;
+        let meter: String = "▮".repeat(bars) + &"▯".repeat(8 - bars);
+        let (state, color) = match (app.muted, app.ptt, app.talking) {
+            (true, ..) => ("muted", DANGER),
+            (false, true, true) => ("ptt: talking", ACCENT),
+            (false, true, false) => ("ptt", DIM),
+            (false, false, _) => ("open mic", ACCENT),
+        };
+        spans.push(Span::styled(format!("· 🎙 {meter} "), Style::default().fg(if app.mic_open() { ACCENT } else { DIM })));
+        spans.push(Span::styled(format!("{state} "), Style::default().fg(color)));
+        if app.echo {
+            spans.push(Span::styled("· echo test ", Style::default().fg(Color::Yellow)));
+        }
+    }
     if let Some(n) = &app.notice {
         spans.push(Span::styled(
             format!("· {}", n.text),
