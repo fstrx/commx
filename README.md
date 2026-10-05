@@ -106,8 +106,8 @@ Each room chooses its kill mode when it's created. Every member enforces the hos
 - **Headphones.** Use them. There's no echo cancellation yet.
 - **Testing alone.** `/echotest` runs your microphone through the whole receive path (Opus encode → jitter buffer → decode → mix → speakers) and plays you back about a second later. Use it to check devices and levels without anyone else.
 - **Push-to-talk.** `/ptt`, then hold Space while the input box is empty.
-  - Hold-to-talk needs a terminal that reports key releases. Windows Terminal does, and so do kitty, WezTerm, Ghostty, foot, and iTerm2 with CSI-u enabled.
-  - In other terminals, Space toggles talking on and off.
+  - Works in every terminal. Where the terminal reports key releases (Windows Terminal, kitty, WezTerm, Ghostty, foot, iTerm2 with CSI-u), the mic closes about 150 ms after you let go.
+  - Elsewhere (e.g. macOS Terminal) the mic closes about 0.7 s after the key's auto-repeat stops.
   - Muting and push-to-talk still send silence frames, so they leak nothing.
 - **Speaking indicator.** The call header highlights whoever is talking. Each listener works this out from the audio it decodes, so nothing extra is sent. The status bar shows your own mic level.
 - **Devices.** `/devices` lists microphones and speakers; `/mic <n>` and `/speaker <n>` switch them, even mid-call. Device names never leave your machine.

@@ -145,6 +145,7 @@ async fn main() -> Result<()> {
             let mut reqs = tokio::select! {
                 _ = refresh.tick() => vec![IpcRequest::Status],
                 _ = audio_tick.tick() => {
+                    app.ptt_tick(Instant::now());
                     match &engine {
                         Some((target, e)) => {
                             if *target == AudioFor::Echo {
@@ -242,15 +243,9 @@ async fn main() -> Result<()> {
 
 fn on_input(app: &mut App, ev: Event) -> Vec<IpcRequest> {
     let Event::Key(k) = ev else { return Vec::new() };
-    // Push-to-talk: Space with an empty input. Hold-to-talk where the
-    // terminal reports releases, toggle otherwise.
+    // Push-to-talk: hold Space with an empty input (see App::ptt_key).
     if app.ptt && app.secret.is_none() && app.input.is_empty() && k.code == KeyCode::Char(' ') && k.modifiers.is_empty() {
-        match (app.release_keys, k.kind) {
-            (true, KeyEventKind::Press) => app.talking = true,
-            (true, KeyEventKind::Release) => app.talking = false,
-            (false, KeyEventKind::Press) => app.talking = !app.talking,
-            _ => {}
-        }
+        app.ptt_key(k.kind != KeyEventKind::Release, Instant::now());
         return Vec::new();
     }
     if k.kind != KeyEventKind::Press {

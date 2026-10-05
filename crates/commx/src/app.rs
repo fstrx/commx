@@ -5,6 +5,14 @@ use commx_core::ipc::{CallInfo, ChatLine, IpcEvent, IpcRequest, RoomSummary};
 use commx_core::secmem::SealedLog;
 use crate::voice::DeviceChoice;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+/// After a key release, stay open this long in case it's an auto-repeat
+/// release/press pair rather than the user letting go.
+const RELEASE_GRACE: Duration = Duration::from_millis(150);
+/// Without release events, stay open this long after the last press/repeat.
+/// Must exceed the OS key-repeat delay (macOS default ≈ 500 ms).
+const NO_RELEASE_HOLD: Duration = Duration::from_millis(700);
 
 const HISTORY: usize = 500;
 
@@ -80,6 +88,9 @@ pub struct App {
     /// Push-to-talk mode, and whether the talk key is currently down.
     pub ptt: bool,
     pub talking: bool,
+    /// Push-to-talk stays open until this instant; every press/repeat of the
+    /// talk key pushes it forward, a release pulls it in. See `ptt_key`.
+    talk_until: Option<Instant>,
     /// Terminal reports key releases (hold-to-talk); otherwise Space toggles.
     pub release_keys: bool,
     /// Local loopback test is running.
@@ -110,6 +121,7 @@ impl App {
             muted: false,
             ptt: false,
             talking: false,
+            talk_until: None,
             release_keys: false,
             echo: false,
             devices: DeviceChoice::default(),
@@ -123,6 +135,29 @@ impl App {
             app.log(*h, false);
         }
         app
+    }
+
+    /// Talk-key event. Holding a key makes terminals auto-repeat it (~30/s),
+    /// and some send a release+press pair per repeat, so individual events
+    /// must never flip the mic directly — that's what made it flicker.
+    /// Instead each event moves a deadline:
+    /// - press/repeat: open until the key is released (or, if the terminal
+    ///   can't report releases, until auto-repeat stops for `NO_RELEASE_HOLD`);
+    /// - release: close after `RELEASE_GRACE`, absorbing release/press pairs.
+    pub fn ptt_key(&mut self, pressed: bool, now: Instant) {
+        self.talk_until = Some(if !pressed {
+            now + RELEASE_GRACE
+        } else if self.release_keys {
+            now + Duration::from_secs(3600)
+        } else {
+            now + NO_RELEASE_HOLD
+        });
+        self.ptt_tick(now);
+    }
+
+    /// Re-evaluate the talk deadline (called on every audio tick).
+    pub fn ptt_tick(&mut self, now: Instant) {
+        self.talking = self.ptt && self.talk_until.is_some_and(|t| t > now);
     }
 
     /// Is our microphone actually sending sound (vs. silence frames)?
@@ -445,9 +480,9 @@ impl App {
             Command::Ptt => {
                 self.ptt = !self.ptt;
                 self.talking = false;
-                let how = if self.release_keys { "hold Space" } else { "press Space to start/stop" };
+                self.talk_until = None;
                 self.notify(
-                    if self.ptt { format!("push-to-talk on: {how} with an empty input") } else { "push-to-talk off: open mic".into() },
+                    if self.ptt { "push-to-talk on: hold Space with an empty input" } else { "push-to-talk off: open mic" },
                     false,
                 );
                 Vec::new()
@@ -515,6 +550,50 @@ mod tests {
         assert!(app.mic_open(), "ptt held");
         app.muted = true;
         assert!(!app.mic_open(), "mute wins");
+    }
+
+    /// Holding the key: initial press, OS repeat delay, then ~30 Hz repeats.
+    fn hold(app: &mut App, t0: Instant, release_pairs: bool) -> Vec<bool> {
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut open = Vec::new();
+        app.ptt_key(true, ms(0));
+        open.push(app.talking);
+        for n in (500..1500).step_by(33) {
+            if release_pairs {
+                app.ptt_key(false, ms(n));
+                open.push(app.talking);
+            }
+            app.ptt_key(true, ms(n + 1));
+            open.push(app.talking);
+            app.ptt_tick(ms(n + 20));
+            open.push(app.talking);
+        }
+        open
+    }
+
+    #[test]
+    fn holding_ptt_never_flickers_without_release_events() {
+        let mut app = App::new();
+        app.ptt = true;
+        let t0 = Instant::now();
+        app.ptt_tick(t0 + Duration::from_millis(300)); // inside the OS repeat delay
+        assert!(!app.talking);
+        assert!(hold(&mut app, t0, false).iter().all(|o| *o), "flickered while held");
+        app.ptt_tick(t0 + Duration::from_millis(1500 + 800));
+        assert!(!app.talking, "closes once repeats stop");
+    }
+
+    #[test]
+    fn holding_ptt_never_flickers_with_release_repeat_pairs() {
+        let mut app = App::new();
+        app.ptt = true;
+        app.release_keys = true;
+        let t0 = Instant::now();
+        assert!(hold(&mut app, t0, true).iter().all(|o| *o), "flickered while held");
+        app.ptt_key(false, t0 + Duration::from_millis(2000));
+        assert!(app.talking, "grace after release");
+        app.ptt_tick(t0 + Duration::from_millis(2200));
+        assert!(!app.talking, "closed after real release");
     }
 
     #[test]
