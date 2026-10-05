@@ -124,3 +124,7 @@ crates/commxd       daemon: transports (TCP/Tor), rooms, kill switch, files, pow
 crates/commx        ratatui TUI
 dist/               launchd, systemd, Windows installer
 ```
+
+## License
+
+[AGPL-3.0-or-later](LICENSE). You can use, modify and share commx freely. If you distribute it, or run a modified version as a network service, you must publish your source under the same license.

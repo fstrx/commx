@@ -21,7 +21,7 @@ commx is unaudited by third parties. This file records the internal review and t
 
 ## Internal audit (October 2026)
 
-Findings from reviewing the MVP, all fixed in commit `67ccf43` unless noted. Regression tests live in `crates/commxd/tests/rooms.rs`.
+Findings from reviewing the MVP, all fixed in commit `5a48646` unless noted. Regression tests live in `crates/commxd/tests/rooms.rs`.
 
 | id | severity | finding | fix |
 |---|---|---|---|
@@ -31,7 +31,7 @@ Findings from reviewing the MVP, all fixed in commit `67ccf43` unless noted. Reg
 | M2 | medium | Remote room names, aliases and message text weren't sanitized. That allowed terminal escape injection (in `commx nuke` output) and bidi/zero-width spoofing. | Control and formatting characters are replaced at the daemon's trust boundary. Names are validated. |
 | M3 | medium | Duplicate display names were allowed in a room, so one member could impersonate another. | The host rejects duplicate names, case-insensitively. Fingerprints are shown on join. |
 | M4 | medium | Argon2 used library defaults (19 MiB, t=2), and the parameters weren't stored in the file, so they could never be raised. | Format `CXK2`: 64 MiB, t=3, with parameters stored in an authenticated header. |
-| M5 | medium | Plaintext lingered in memory: history, IPC buffers and freed heap. | Fixed in `e85c7ea`: sealed history, zero-on-free allocator, locked keys. Checked with a memory dump. |
+| M5 | medium | Plaintext lingered in memory: history, IPC buffers and freed heap. | Fixed in `6e2c1a8`: sealed history, zero-on-free allocator, locked keys. Checked with a memory dump. |
 
 ## Known limits
 
