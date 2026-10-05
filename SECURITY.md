@@ -33,6 +33,15 @@ Findings from reviewing the MVP, all fixed in commit `5a48646` unless noted. Reg
 | M4 | medium | Argon2 used library defaults (19 MiB, t=2), and the parameters weren't stored in the file, so they could never be raised. | Format `CXK2`: 64 MiB, t=3, with parameters stored in an authenticated header. |
 | M5 | medium | Plaintext lingered in memory: history, IPC buffers and freed heap. | Fixed in `6e2c1a8`: sealed history, zero-on-free allocator, locked keys. Checked with a memory dump. |
 
+## Internal audit #2 (October 2026, v0.1.0 → v0.2.0)
+
+This covers everything since the first audit: memory hardening, Tor, files, Windows, voice, UDP and fault containment. **Both findings affect v0.2.0 and are fixed after it. Upgrade.**
+
+| id | severity | finding | fix |
+|---|---|---|---|
+| H3 | high | **Path traversal on `/save`.** A malicious room member could announce a file named e.g. `../.ssh/authorized_keys` or `../Library/LaunchAgents/x.plist`. Receivers only stripped control characters, and `/save` joined the name onto Downloads, so the victim's daemon would create attacker-controlled files anywhere the user could write. That's persistence or code execution. | Received names are reduced to one safe path component at the trust boundary. Separators from every OS are handled; dot files, reserved names and over-long names are defused. `/save` independently refuses any path not directly inside the chosen directory, and opens with `O_NOFOLLOW`. An end-to-end test plays the malicious sender, and it fails on the old code. |
+| M6 | medium | **DNS leak in Tor mode.** Joining a room always ran a system DNS lookup on the invite address, meant for the UDP fast path that Tor mode doesn't use. On Linux/glibc and Windows that sends a cleartext query for the room's `.onion` to the resolver. Observers could then see which IPs join the same room. | The lookup now runs only when the UDP path is on. `.onion` names are never handed to the system resolver in any mode. |
+
 ## Fault containment
 
 A daemon crash is a denial of service against every room on that node, since the kill switch nukes them all. So the daemon treats "a peer can crash me" as a security bug:

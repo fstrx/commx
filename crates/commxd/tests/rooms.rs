@@ -614,3 +614,29 @@ fn hostile_network_input_cannot_kill_the_daemon() {
     b.send(&room, "unbothered");
     a.expect_msg("bob", "unbothered");
 }
+
+#[test]
+fn malicious_file_name_cannot_escape_the_save_directory() {
+    let (mut a, mut b) = (Node::spawn("pt-a"), Node::spawn("pt-b"));
+    a.alias("alice");
+    b.alias("mallory");
+    let (room, code) = a.room("r", "HostOnly", 15, false);
+    b.join(&code);
+
+    // Victim's layout: <dir>/home/Downloads is where /save goes by default.
+    let home = a.dir.join("home");
+    let downloads = home.join("Downloads");
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    std::fs::create_dir_all(&downloads).unwrap();
+    let payload = b.dir.join("payload");
+    std::fs::write(&payload, b"ssh-ed25519 AAAA attacker").unwrap();
+
+    b.req(json!({"op": "debug_send_file_as", "room_id": room, "path": payload.to_str().unwrap(),
+                 "name": "../.ssh/authorized_keys"}));
+    a.expect_system("ready — /save 1");
+    a.req(json!({"op": "save_file", "room_id": room, "no": 1, "dest": downloads.to_str().unwrap()}));
+    a.expect("saved", 10, |v| v["ev"] == "ok" && v["msg"].as_str().unwrap().starts_with("saved #1"));
+
+    assert!(!home.join(".ssh/authorized_keys").exists(), "wrote outside Downloads");
+    assert_eq!(std::fs::read(downloads.join("authorized_keys")).unwrap(), b"ssh-ed25519 AAAA attacker");
+}

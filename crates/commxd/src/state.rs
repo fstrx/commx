@@ -9,7 +9,7 @@ use commx_core::identity::{verify, Identity};
 use commx_core::invite::Invite;
 use commx_core::ipc::{AliasInfo, ChatLine, FileInfo, IpcEvent, RoomSummary};
 use commx_core::room::{KillMode, MemberInfo, RoomConfig, MIN_GRACE_SECS};
-use commx_core::text::{clean, valid_name};
+use commx_core::text::{clean, safe_file_name, valid_name};
 use commx_core::wire::{channel_binding, WireMsg};
 use commx_core::{room_id_hex, RoomId, MAX_TEXT_LEN};
 use rand::{rngs::OsRng, RngCore};
@@ -472,7 +472,9 @@ impl Room {
         if !meta.is_consistent() {
             bail!("bad file metadata");
         }
-        meta.name = clean(&meta.name);
+        // Trust boundary: the name is chosen by a peer and later joined onto
+        // a local directory by /save. One safe component, nothing else.
+        meta.name = safe_file_name(&meta.name);
         Ok(meta)
     }
 

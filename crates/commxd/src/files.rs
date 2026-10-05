@@ -271,9 +271,12 @@ impl BlobReader {
     /// Write a decrypted copy to `dest`, refusing to overwrite anything.
     pub fn export(&self, dest: &Path) -> Result<()> {
         self.verify()?;
-        let mut out = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        // Never follow a symlink someone planted at the destination name.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NOFOLLOW);
+        let mut out = opts
             .open(dest)
             .with_context(|| format!("can't create {}", dest.display()))?;
         let res = self.stream(|p| Ok(out.write_all(p)?));

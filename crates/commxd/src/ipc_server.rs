@@ -102,6 +102,26 @@ async fn client(shared: Shared, transport: Arc<Net>, r: Reader, mut w: Writer) {
     writer.abort();
 }
 
+/// Where `/save` writes. A directory gets the (already sanitized) peer file
+/// name joined on, re-checked here so that, independently of the receive-side
+/// sanitizing, nothing can land outside the directory the user chose.
+fn save_path(dest: &std::path::Path, name: &str) -> Result<std::path::PathBuf> {
+    use std::path::Component;
+    if !dest.is_dir() {
+        // An explicit file path typed by the local user.
+        return Ok(dest.to_path_buf());
+    }
+    let mut comps = std::path::Path::new(name).components();
+    if !matches!((comps.next(), comps.next()), (Some(Component::Normal(_)), None)) {
+        return Err(anyhow!("refusing unsafe file name"));
+    }
+    let out = dest.join(name);
+    if out.parent() != Some(dest) {
+        return Err(anyhow!("refusing to write outside {}", dest.display()));
+    }
+    Ok(out)
+}
+
 fn room_arg(s: &str) -> Result<RoomId> {
     parse_room_id(s).ok_or_else(|| anyhow!("bad room id"))
 }
@@ -226,7 +246,7 @@ async fn handle(
             let (shared, tx) = (shared.clone(), tx.clone());
             // Big files take a while; don't block this client's other requests.
             tokio::spawn(async move {
-                if let Err(e) = net::send_file(shared, id, path).await {
+                if let Err(e) = net::send_file(shared, id, path, None).await {
                     let _ = tx.send(IpcEvent::Error { msg: format!("send failed: {e}") });
                 }
             });
@@ -247,10 +267,7 @@ async fn handle(
                 }
                 (e.reader().ok_or_else(|| anyhow!("file #{no} has no local copy"))?, e.name.clone())
             };
-            let mut dest = std::path::PathBuf::from(dest);
-            if dest.is_dir() {
-                dest = dest.join(&name);
-            }
+            let dest = save_path(std::path::Path::new(&dest), &name)?;
             let out = dest.clone();
             tokio::task::spawn_blocking(move || reader.export(&out)).await??;
             ok(tx, format!("saved #{no} to {} (decrypted copy — commx can't nuke it)", dest.display()));
@@ -281,6 +298,12 @@ async fn handle(
             }
         }
         #[cfg(debug_assertions)]
+        IpcRequest::DebugSendFileAs { room_id, path, name } => {
+            let id = room_arg(&room_id)?;
+            net::send_file(shared.clone(), id, std::path::PathBuf::from(path), Some(name)).await?;
+            ok(tx, "sent");
+        }
+        #[cfg(debug_assertions)]
         IpcRequest::DebugFault { scope, room_id } => {
             let mut d = lock(shared);
             match (scope.as_str(), room_id.as_deref().and_then(parse_room_id)) {
@@ -300,4 +323,21 @@ async fn handle(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_path_never_leaves_the_chosen_directory() {
+        let dir = std::env::temp_dir();
+        assert_eq!(save_path(&dir, "report.pdf").unwrap(), dir.join("report.pdf"));
+        for evil in ["../x", "a/b", "/etc/passwd", "..", ".", ""] {
+            assert!(save_path(&dir, evil).is_err(), "{evil:?} accepted");
+        }
+        // An explicit file path is the user's own choice.
+        let f = dir.join("definitely-not-a-dir.bin");
+        assert_eq!(save_path(&f, "../ignored").unwrap(), f);
+    }
 }

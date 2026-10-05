@@ -32,6 +32,9 @@ pub enum IpcRequest {
     /// Fault injection for containment tests. Only exists in debug builds.
     #[cfg(debug_assertions)]
     DebugFault { scope: String, room_id: Option<String> },
+    /// Send a file under a raw, unsanitized name (malicious-sender tests). Debug builds only.
+    #[cfg(debug_assertions)]
+    DebugSendFileAs { room_id: String, path: String, name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

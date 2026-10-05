@@ -15,7 +15,7 @@ use commx_core::invite::Invite;
 use commx_core::ipc::IpcEvent;
 use commx_core::room::MemberInfo;
 use commx_core::wire::{channel_binding, WireMsg};
-use commx_core::text::clean;
+use commx_core::text::{clean, safe_file_name};
 use commx_core::RoomId;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -221,8 +221,19 @@ pub async fn join(shared: Shared, transport: Arc<Net>, code: &str) -> Result<Roo
     }
     let key = RoomKey::from_bytes(&open_sealed(&me, &sealed_key).map_err(|_| anyhow!("can't open room key"))?)?;
 
-    // The host's UDP port is its TCP port (same advertised address).
-    let host_udp = tokio::net::lookup_host(&invite.addr).await.ok().and_then(|mut a| a.next());
+    // The host's UDP port is its TCP port (same advertised address). Resolve
+    // only when the UDP fast path is actually on: in Tor mode the system
+    // resolver must never see the address (a cleartext DNS query for a room's
+    // onion would link its members' IPs to the room).
+    let udp_enabled = {
+        let d = lock(&shared);
+        d.udp_out.is_some() && !d.net.is_tor()
+    };
+    let host_udp = if should_resolve_for_udp(&invite.addr, udp_enabled) {
+        tokio::net::lookup_host(&invite.addr).await.ok().and_then(|mut a| a.next())
+    } else {
+        None
+    };
     let (lanes, rxs) = lanes();
     let (cancel_tx, cancel_rx) = oneshot::channel();
     // Everything the host told us about the room is displayed; scrub it.
@@ -285,16 +296,24 @@ pub async fn join(shared: Shared, transport: Arc<Net>, code: &str) -> Result<Roo
 
 /// Share a file: hash it, announce it through the chain, then stream
 /// encrypted chunks on the bulk lane.
-pub async fn send_file(shared: Shared, room_id: RoomId, path: std::path::PathBuf) -> Result<()> {
+///
+/// `raw_name` (debug builds only, for tests) announces the file under an
+/// unsanitized name, impersonating a malicious sender.
+pub async fn send_file(
+    shared: Shared,
+    room_id: RoomId,
+    path: std::path::PathBuf,
+    raw_name: Option<String>,
+) -> Result<()> {
     let p = path.clone();
     let (size, hash) = tokio::task::spawn_blocking(move || hash_file(&p)).await??;
     if size > MAX_FILE_SIZE {
         bail!("file too large (max {})", human_size(MAX_FILE_SIZE));
     }
-    let name: String = clean(&path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into()))
-        .chars()
-        .take(128)
-        .collect();
+    let mut name = safe_file_name(&path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+    if let (true, Some(raw)) = (cfg!(debug_assertions), raw_name) {
+        name = raw;
+    }
     let key = Locked::<32>::random();
     let meta = FileMeta { name, size, chunks: FileMeta::expected_chunks(size), hash, key: *key.bytes() };
     let mut file_id = [0u8; 16];
@@ -338,4 +357,26 @@ pub async fn send_file(shared: Shared, room_id: RoomId, path: std::path::PathBuf
         room.system(&ev, if changed { format!("📎 #{no} failed: file changed while sending") } else { format!("📎 #{no} sent") });
     }
     Ok(())
+}
+
+/// May `addr` be handed to the OS resolver for the UDP fast path? Never in
+/// Tor mode, and never for an onion name, whatever the mode.
+fn should_resolve_for_udp(addr: &str, udp_enabled: bool) -> bool {
+    let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h).trim_end_matches('.');
+    udp_enabled && !host.to_ascii_lowercase().ends_with(".onion")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn onion_addresses_never_reach_the_system_resolver() {
+        let onion = "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion:4700";
+        assert!(!should_resolve_for_udp(onion, false), "tor mode");
+        assert!(!should_resolve_for_udp(onion, true), "onion name, even if udp somehow on");
+        assert!(!should_resolve_for_udp("ABC.ONION.:4700", true), "case / trailing dot");
+        assert!(should_resolve_for_udp("192.168.1.5:4700", true));
+        assert!(!should_resolve_for_udp("192.168.1.5:4700", false), "--no-udp");
+    }
 }
