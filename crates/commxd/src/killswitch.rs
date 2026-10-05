@@ -8,7 +8,8 @@ use commx_core::{room_id_hex, RoomId};
 use std::time::{Duration, Instant};
 
 use crate::files::FileState;
-use crate::state::{Daemon, Followup, PeerKind, Role};
+use crate::state::{Daemon, Events, Followup, PeerKind, Role, Room};
+use crate::supervise::contain;
 
 const FILE_STALL: Duration = Duration::from_secs(90);
 
@@ -23,6 +24,10 @@ impl Daemon {
     pub fn on_wire(&mut self, room_id: RoomId, kind: PeerKind, msg: WireMsg) -> Followup {
         let ev = self.events.clone();
         let Some(room) = self.rooms.get_mut(&room_id) else { return Followup::default() };
+        #[cfg(debug_assertions)]
+        if room.fault_armed == Some("wire") {
+            panic!("injected fault: room wire handling");
+        }
         room.touch(kind);
         match msg {
             WireMsg::FileChunk { .. } => return room.on_chunk(kind, msg),
@@ -159,8 +164,18 @@ impl Daemon {
     }
 
     /// Runs every second: heartbeats, liveness, sleep detection, invite expiry.
+    /// Runs every second: heartbeats, liveness, sleep detection, invite expiry.
+    ///
+    /// Each room is its own fault domain: if one room's step panics, that
+    /// room is nuked and every other room still gets its heartbeats and its
+    /// kill switch.
     pub fn tick(&mut self) {
         let now = Instant::now();
+        #[cfg(debug_assertions)]
+        if self.fault.as_deref() == Some("tick-task") {
+            self.fault = None;
+            panic!("injected fault: tick task");
+        }
 
         let slept = self.power.tick();
         if !slept.is_zero() {
@@ -176,56 +191,86 @@ impl Daemon {
             }
         }
 
-        let mut gone = Vec::new();
-        for (id, room) in self.rooms.iter_mut() {
-            let grace = Duration::from_secs(room.cfg.grace_secs);
-            if now.duration_since(room.last_hb) >= Duration::from_secs(room.cfg.heartbeat_secs()) {
-                room.send_all(&WireMsg::Heartbeat);
-                room.last_hb = now;
-            }
-            if let Role::Member { host } = &mut room.role {
-                if let Some(u) = &mut host.udp {
-                    u.maybe_ping();
-                }
-            }
-            match &room.role {
-                Role::Host { peers } => {
-                    for (pk, p) in peers {
-                        if p.overflowed() {
-                            gone.push((*id, PeerKind::Member(*pk), "can't keep up"));
-                        } else if now.duration_since(p.last_seen) > grace {
-                            gone.push((*id, PeerKind::Member(*pk), "timed out"));
+        let ev = self.events.clone();
+        let ids: Vec<RoomId> = self.rooms.keys().copied().collect();
+        for id in ids {
+            let Some(room) = self.rooms.get_mut(&id) else { continue };
+            match contain(|| tick_room(room, &ev, now)) {
+                Ok(gone) => {
+                    for (kind, why) in gone {
+                        if contain(|| self.peer_gone(id, kind, why)).is_err() {
+                            self.contained_fault(&id);
                         }
                     }
                 }
-                Role::Member { host } => {
-                    if host.overflowed() {
-                        gone.push((*id, PeerKind::Host, "can't keep up"));
-                    } else if now.duration_since(host.last_seen) > grace {
-                        gone.push((*id, PeerKind::Host, "timed out"));
-                    }
-                }
-            }
-        }
-        for (id, kind, why) in gone {
-            self.peer_gone(id, kind, why);
-        }
-
-        let ev = self.events.clone();
-        for room in self.rooms.values_mut() {
-            let stalled: Vec<[u8; 16]> =
-                room.files.values().filter(|f| f.stalled(FILE_STALL)).map(|f| f.id).collect();
-            for id in stalled {
-                if let Some(f) = room.files.get_mut(&id) {
-                    f.state = FileState::Failed("transfer stalled".into());
-                    f.blob = None;
-                    let line = format!("📎 #{} '{}' failed: transfer stalled", f.no, f.name);
-                    room.system(&ev, line);
-                }
+                Err(()) => self.contained_fault(&id),
             }
         }
 
         self.invites.retain(|_, i| i.expires > now);
+        // Forget UDP paths whose room or peer is gone.
+        let rooms = &self.rooms;
+        self.udp_index.retain(|_, (rid, kind)| match (rooms.get(rid).map(|r| &r.role), kind) {
+            (Some(Role::Host { peers }), PeerKind::Member(pk)) => peers.contains_key(pk),
+            (Some(Role::Member { .. }), PeerKind::Host) => true,
+            _ => false,
+        });
         self.refresh_power();
     }
+
+    /// A room's code panicked: its state can't be trusted, so destroy it.
+    /// Done with the panic already caught, so it never reaches the daemon.
+    pub fn contained_fault(&mut self, room_id: &RoomId) {
+        // Even the nuke is contained; worst case the room is just dropped.
+        if contain(|| self.nuke(room_id, "internal fault (contained)", true)).is_err() {
+            self.rooms.remove(room_id);
+        }
+    }
+}
+
+/// One room's per-second work. Returns peers to treat as gone.
+fn tick_room(room: &mut Room, ev: &Events, now: Instant) -> Vec<(PeerKind, &'static str)> {
+    #[cfg(debug_assertions)]
+    if room.fault_armed == Some("tick") {
+        panic!("injected fault: room tick");
+    }
+    let grace = Duration::from_secs(room.cfg.grace_secs);
+    if now.duration_since(room.last_hb) >= Duration::from_secs(room.cfg.heartbeat_secs()) {
+        room.send_all(&WireMsg::Heartbeat);
+        room.last_hb = now;
+    }
+    if let Role::Member { host } = &mut room.role {
+        if let Some(u) = &mut host.udp {
+            u.maybe_ping();
+        }
+    }
+    let mut gone = Vec::new();
+    match &room.role {
+        Role::Host { peers } => {
+            for (pk, p) in peers {
+                if p.overflowed() {
+                    gone.push((PeerKind::Member(*pk), "can't keep up"));
+                } else if now.duration_since(p.last_seen) > grace {
+                    gone.push((PeerKind::Member(*pk), "timed out"));
+                }
+            }
+        }
+        Role::Member { host } => {
+            if host.overflowed() {
+                gone.push((PeerKind::Host, "can't keep up"));
+            } else if now.duration_since(host.last_seen) > grace {
+                gone.push((PeerKind::Host, "timed out"));
+            }
+        }
+    }
+    let stalled: Vec<[u8; 16]> = room.files.values().filter(|f| f.stalled(FILE_STALL)).map(|f| f.id).collect();
+    for id in stalled {
+        if let Some(f) = room.files.get_mut(&id) {
+            f.state = FileState::Failed("transfer stalled".into());
+            f.blob = None;
+            let line = format!("📎 #{} '{}' failed: transfer stalled", f.no, f.name);
+            room.system(ev, line);
+        }
+    }
+    gone
 }

@@ -112,6 +112,27 @@ Each room chooses its kill mode when it's created. Every member enforces the hos
 - **Speaking indicator.** The call header highlights whoever is talking. Each listener works this out from the audio it decodes, so nothing extra is sent. The status bar shows your own mic level.
 - **Devices.** `/devices` lists microphones and speakers; `/mic <n>` and `/speaker <n>` switch them, even mid-call. Device names never leave your machine.
 
+## Reliability
+
+**Design invariant: no single peer, room, file transfer, or UI operation can terminate the daemon.** `commxd` exits only on a shutdown signal or a startup failure.
+
+| fault in | contained by | cost |
+|---|---|---|
+| a peer connection (garbage, hostile values, disconnects) | its own tasks, `Result` everywhere, overflow-checked counters | that connection |
+| a room (any panic while handling it) | a fault boundary around every room operation, including each room's kill-switch tick | that room is nuked ("internal fault") and its peers are told |
+| a file transfer | its own task; disk I/O runs off the async runtime | that transfer fails |
+| a UI/IPC request | each request runs in its own task | an error reply; the client keeps working |
+| core loops (peer listener, control socket, kill-switch ticker, UDP, tor) | a supervisor restarts them with backoff | a brief gap |
+
+Release builds unwind on panic instead of aborting, so panics can be caught, and destructors still run and wipe keys. Panic messages are never printed (only their source location), so a crash log can't leak content. The fault-injection tests in `crates/commxd/tests/rooms.rs` do the following against real daemons:
+- crash an IPC request;
+- crash one room's message handling;
+- crash one room's tick;
+- crash the whole kill-switch ticker;
+- spray garbage at the TCP and UDP ports.
+
+Each time they check that everything else keeps working, including the kill switch.
+
 ## Memory hardening
 
 The goal: a RAM dump or memory scan of commx shouldn't reveal messages.

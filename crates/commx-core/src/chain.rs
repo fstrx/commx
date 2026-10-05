@@ -159,12 +159,14 @@ impl Chain {
         let host_sig = host.sign(&Block::signing_bytes(seq, &self.head, &payload));
         let block = Block { seq, prev_hash: self.head, payload, host_sig };
         self.head = block.hash();
-        self.next_seq += 1;
+        self.next_seq = self.next_seq.saturating_add(1);
         block
     }
 
     /// Member side: accept a block only if it extends our head exactly.
     pub fn verify_append(&mut self, block: &Block) -> Result<()> {
+        // Peer-chosen counters must never overflow (that would panic or wrap).
+        let next = self.next_seq.checked_add(1).ok_or_else(|| anyhow::anyhow!("sequence exhausted"))?;
         if block.payload.room_id != self.room_id {
             bail!("block for another room");
         }
@@ -182,7 +184,7 @@ impl Chain {
             bail!("bad author signature at seq {}", block.seq);
         }
         self.head = block.hash();
-        self.next_seq += 1;
+        self.next_seq = next;
         Ok(())
     }
 }
@@ -244,6 +246,15 @@ mod tests {
 
         mc.verify_append(&b1).unwrap();
         mc.verify_append(&b2).unwrap();
+    }
+
+    #[test]
+    fn hostile_sequence_numbers_dont_panic() {
+        let (host, alice, _, _) = setup();
+        let mut mc = Chain::resume([7; 16], host.public().sign_pk, u64::MAX, [0; 32]);
+        let mut hc = Chain::resume([7; 16], host.public().sign_pk, u64::MAX, [0; 32]);
+        let b = hc.append(&host, msg(&alice, 0));
+        assert!(mc.verify_append(&b).is_err());
     }
 
     #[test]

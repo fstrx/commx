@@ -245,6 +245,9 @@ pub struct Room {
     /// At most one call per room; dropping it wipes the call key.
     pub call: Option<Call>,
     pub over_tor: bool,
+    /// Test-only fault injection point ("wire" / "tick"); inert in release builds.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    pub fault_armed: Option<&'static str>,
 }
 
 /// Work the connection task does after releasing the lock.
@@ -335,7 +338,7 @@ impl Room {
         self.keys.insert(epoch, key);
         self.epoch = epoch;
         // Keep the previous epoch for in-flight messages; drop the rest.
-        self.keys.retain(|e, _| *e + 1 >= epoch);
+        self.keys.retain(|e, _| e.saturating_add(1) >= epoch);
     }
 
     fn decrypt_msg(&self, p: &Payload) -> Result<String> {
@@ -388,7 +391,7 @@ impl Room {
                 if self.files.contains_key(file_id) {
                     bail!("duplicate file id");
                 }
-                self.next_file_no += 1;
+                self.next_file_no = self.next_file_no.saturating_add(1);
                 let no = self.next_file_no;
                 let entry = if mine {
                     FileEntry::outgoing(no, *file_id, p.author, from.clone(), &meta)
@@ -429,7 +432,7 @@ impl Room {
     /// Host: new room key for whoever is still here.
     pub fn rotate_key(&mut self, ev: &Events) -> Result<()> {
         let key = RoomKey::generate();
-        let new_epoch = self.epoch + 1;
+        let new_epoch = self.epoch.checked_add(1).ok_or_else(|| anyhow!("key epochs exhausted"))?;
         let me_pk = self.me.public().sign_pk;
         let sealed = self
             .members
@@ -566,6 +569,9 @@ pub struct Daemon {
     pub udp_index: HashMap<[u8; 8], (RoomId, PeerKind)>,
     /// Set in direct-TCP mode once the UDP socket is up.
     pub udp_out: Option<Outbox>,
+    /// Test-only fault injection ("tick-task"); inert in release builds.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    pub fault: Option<String>,
     pub events: Events,
     pub power: Power,
 }
@@ -581,6 +587,7 @@ impl Daemon {
             invites: HashMap::new(),
             udp_index: HashMap::new(),
             udp_out: None,
+            fault: None,
             events: Events::new(),
             power: Power::new(keep_awake),
         }
@@ -681,6 +688,7 @@ impl Daemon {
             call: None,
             data_dir: self.data_dir.clone(),
             over_tor: self.net.is_tor(),
+            fault_armed: None,
         };
         room.keys.insert(0, RoomKey::generate());
         let ev = self.events.clone();

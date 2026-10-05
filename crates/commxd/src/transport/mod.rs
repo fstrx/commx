@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::OnceCell;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use zeroize::Zeroizing;
 
@@ -31,7 +30,7 @@ const TOR_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 enum Mode {
     Tcp { advertise: String },
-    Tor { tor: Box<OnceCell<tor::Tor>>, status: std::sync::Mutex<String> },
+    Tor { tor: std::sync::RwLock<Option<Arc<tor::Tor>>>, status: std::sync::Mutex<String> },
 }
 
 /// The daemon's network: dialing peers, accepting them, and giving each room
@@ -49,7 +48,7 @@ impl Net {
     }
 
     pub fn tor(key: NodeKey, local_port: u16) -> Self {
-        let mode = Mode::Tor { tor: Box::default(), status: std::sync::Mutex::new("tor starting".into()) };
+        let mode = Mode::Tor { tor: std::sync::RwLock::new(None), status: std::sync::Mutex::new("tor starting".into()) };
         Self { key, local_port, mode }
     }
 
@@ -57,33 +56,59 @@ impl Net {
         matches!(self.mode, Mode::Tor { .. })
     }
 
-    /// Launch tor in the background and track bootstrap progress.
+    /// Run tor under supervision: launch, bootstrap, then health-check. If
+    /// tor dies, the slot is cleared (new rooms/joins report "not ready") and
+    /// tor is relaunched with backoff. Rooms hosted on the dead instance lose
+    /// their onions and end via the kill switch, as they should.
     pub fn start_tor(self: &Arc<Self>, bin: String, dir: PathBuf) {
         let net = self.clone();
-        tokio::spawn(async move {
-            let Mode::Tor { tor, status } = &net.mode else { return };
-            let set = |s: String| *status.lock().unwrap_or_else(|e| e.into_inner()) = s;
-            let t = match tor::Tor::launch(&bin, &dir).await {
-                Ok(t) => t,
-                Err(e) => return set(format!("tor failed: {e}")),
-            };
-            loop {
-                match t.bootstrap_progress().await {
-                    Ok(100) => break,
-                    Ok(p) => set(format!("tor bootstrapping {p}%")),
-                    Err(e) => return set(format!("tor failed: {e}")),
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            let _ = tor.set(t);
-            set("tor ready".into());
+        crate::supervise::supervise("tor", move || {
+            let (net, bin, dir) = (net.clone(), bin.clone(), dir.clone());
+            async move { net.run_tor(&bin, &dir).await }
         });
     }
 
-    fn tor_ready(&self) -> Result<&tor::Tor> {
+    async fn run_tor(&self, bin: &str, dir: &std::path::Path) {
+        let Mode::Tor { tor, status } = &self.mode else { return std::future::pending().await };
+        let set = |s: String| *status.lock().unwrap_or_else(|e| e.into_inner()) = s;
+        let slot = |t: Option<Arc<tor::Tor>>| *tor.write().unwrap_or_else(|e| e.into_inner()) = t;
+        slot(None);
+        set("tor starting".into());
+        let t = match tor::Tor::launch(bin, dir).await {
+            Ok(t) => Arc::new(t),
+            Err(e) => {
+                set(format!("tor failed: {e}"));
+                // Don't hammer a missing/broken binary; supervisor backs off too.
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                return;
+            }
+        };
+        loop {
+            match t.bootstrap_progress().await {
+                Ok(100) => break,
+                Ok(p) => set(format!("tor bootstrapping {p}%")),
+                Err(e) => return set(format!("tor failed: {e}")),
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        slot(Some(t.clone()));
+        set("tor ready".into());
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if t.bootstrap_progress().await.is_err() {
+                slot(None);
+                set("tor died; restarting".into());
+                return;
+            }
+        }
+    }
+
+    fn tor_ready(&self) -> Result<Arc<tor::Tor>> {
         match &self.mode {
             Mode::Tor { tor, status } => tor
-                .get()
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
                 .ok_or_else(|| anyhow!("not ready yet: {}", status.lock().unwrap_or_else(|e| e.into_inner()))),
             Mode::Tcp { .. } => bail!("tor is off (start commxd with --tor)"),
         }

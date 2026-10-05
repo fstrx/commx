@@ -33,6 +33,13 @@ Findings from reviewing the MVP, all fixed in commit `5a48646` unless noted. Reg
 | M4 | medium | Argon2 used library defaults (19 MiB, t=2), and the parameters weren't stored in the file, so they could never be raised. | Format `CXK2`: 64 MiB, t=3, with parameters stored in an authenticated header. |
 | M5 | medium | Plaintext lingered in memory: history, IPC buffers and freed heap. | Fixed in `6e2c1a8`: sealed history, zero-on-free allocator, locked keys. Checked with a memory dump. |
 
+## Fault containment
+
+A daemon crash is a denial of service against every room on that node, since the kill switch nukes them all. So the daemon treats "a peer can crash me" as a security bug:
+- Peer-controlled counters are checked: chain sequence numbers and key epochs. A hostile host sending `next_seq = u64::MAX` used to overflow.
+- Every peer/room/IPC boundary contains panics, and core loops are supervised. See [README → Reliability](README.md#reliability).
+- Release builds switched from `panic = "abort"` to `"unwind"`. Under abort, any panic killed the daemon outright and skipped the destructors that wipe keys.
+
 ## Known limits
 
 - **Invites are bearer tokens.** They're single use and last 10 minutes, but anyone who intercepts one first can join. Check the fingerprints shown on join.

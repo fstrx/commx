@@ -13,18 +13,47 @@ use commx_core::local_ipc::{Listener, Reader, Writer};
 use tokio::sync::mpsc;
 
 use crate::files::FileState;
+use crate::supervise::io_backoff;
 use crate::net;
 use crate::state::{lock, Shared};
 use crate::transport::Net;
 
 const MAX_LINE: usize = 64 * 1024;
 
-pub async fn serve(shared: Shared, transport: Arc<Net>, mut listener: Listener) {
+/// Accept loop. The listener is shared so a supervised restart reuses it.
+pub async fn serve(shared: Shared, transport: Arc<Net>, listener: Arc<tokio::sync::Mutex<Listener>>) {
+    let mut listener = listener.lock().await;
     loop {
         // Listener only yields same-user clients.
-        let Ok((r, w)) = listener.accept().await else { continue };
+        let (r, w) = match listener.accept().await {
+            Ok(x) => x,
+            Err(_) => {
+                io_backoff().await;
+                continue;
+            }
+        };
         tokio::spawn(client(shared.clone(), transport.clone(), r, w));
     }
+}
+
+/// The room a request operates on, if any: the fault domain to sacrifice if
+/// handling it panics.
+fn request_room(req: &IpcRequest) -> Option<RoomId> {
+    use IpcRequest::*;
+    let id = match req {
+        Invite { room_id }
+        | Send { room_id, .. }
+        | History { room_id }
+        | Nuke { room_id: Some(room_id) }
+        | SendFile { room_id, .. }
+        | Files { room_id }
+        | SaveFile { room_id, .. }
+        | Call { room_id }
+        | Hangup { room_id }
+        | VoiceOut { room_id, .. } => room_id,
+        _ => return None,
+    };
+    parse_room_id(id)
 }
 
 async fn client(shared: Shared, transport: Arc<Net>, r: Reader, mut w: Writer) {
@@ -49,7 +78,21 @@ async fn client(shared: Shared, transport: Arc<Net>, r: Reader, mut w: Writer) {
     loop {
         let Ok(Some(line)) = lines.next_line().await else { break };
         let reply = match serde_json::from_slice::<IpcRequest>(&line) {
-            Ok(req) => handle(&shared, &transport, req, &tx).await,
+            Ok(req) => {
+                // Fault boundary: each request runs in its own task, so a
+                // panic is an error reply, not a dead daemon.
+                let room = request_room(&req);
+                let (s, t, x) = (shared.clone(), transport.clone(), tx.clone());
+                match tokio::spawn(async move { handle(&s, &t, req, &x).await }).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        if let Some(id) = room {
+                            lock(&shared).contained_fault(&id);
+                        }
+                        Err(anyhow!("internal error (contained)"))
+                    }
+                }
+            }
             Err(e) => Err(anyhow!("bad request: {e}")),
         };
         if let Err(e) = reply {
@@ -236,6 +279,20 @@ async fn handle(
             if let Some(room) = lock(shared).rooms.get_mut(&id) {
                 room.send_voice(&opus)?;
             }
+        }
+        #[cfg(debug_assertions)]
+        IpcRequest::DebugFault { scope, room_id } => {
+            let mut d = lock(shared);
+            match (scope.as_str(), room_id.as_deref().and_then(parse_room_id)) {
+                ("ipc", _) => panic!("injected fault: ipc handler"),
+                ("tick-task", _) => d.fault = Some(scope),
+                (s @ ("wire" | "tick"), Some(id)) => {
+                    let room = d.rooms.get_mut(&id).ok_or_else(|| anyhow!("no such room"))?;
+                    room.fault_armed = Some(if s == "wire" { "wire" } else { "tick" });
+                }
+                _ => return Err(anyhow!("unknown fault scope")),
+            }
+            ok(tx, "fault armed");
         }
         IpcRequest::Nuke { room_id: None } => {
             lock(shared).nuke_all("nuked by you");

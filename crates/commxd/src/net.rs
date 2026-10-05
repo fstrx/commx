@@ -24,6 +24,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit};
 
 use crate::files::hash_file;
+use crate::supervise::contain;
 use crate::udp::UdpPath;
 use crate::state::{
     lock, Followup, Lanes, Peer, PeerKind, Role, Room, Shared, BULK_QUEUE, MAX_LINES, MEDIA_QUEUE, PEER_QUEUE,
@@ -102,11 +103,25 @@ async fn reader_loop(
             _ = &mut cancel => return,
             res = r.recv() => match res {
                 Ok(msg) => {
-                    let fu = lock(&shared).on_wire(room_id, kind, msg);
+                    // Fault boundary: whatever a peer sends, a panic while
+                    // handling it costs at most this room, never the daemon.
+                    let fu = {
+                        let mut d = lock(&shared);
+                        match contain(|| d.on_wire(room_id, kind, msg)) {
+                            Ok(fu) => fu,
+                            Err(()) => {
+                                d.contained_fault(&room_id);
+                                return;
+                            }
+                        }
+                    };
                     run_followup(&shared, room_id, kind, fu).await;
                 }
                 Err(_) => {
-                    lock(&shared).peer_gone(room_id, kind, "connection lost");
+                    let mut d = lock(&shared);
+                    if contain(|| d.peer_gone(room_id, kind, "connection lost")).is_err() {
+                        d.contained_fault(&room_id);
+                    }
                     return;
                 }
             },
@@ -140,7 +155,13 @@ pub async fn handle_inbound(
         let udp = d.udp_out.clone().map(|out| UdpPath::new(&conn.handshake_hash, None, out));
         let udp_id = udp.as_ref().map(|u| u.id);
         let peer = Peer::new(lanes, cancel_tx, udp);
-        let res = d.admit(room_id, token, member, &sig, &conn.handshake_hash, peer);
+        let res = match contain(|| d.admit(room_id, token, member, &sig, &conn.handshake_hash, peer)) {
+            Ok(r) => r,
+            Err(()) => {
+                d.contained_fault(&room_id);
+                Err("internal error".to_string())
+            }
+        };
         if let (Ok(()), Some(id)) = (&res, udp_id) {
             d.udp_index.insert(id, (room_id, PeerKind::Member(sign_pk)));
         }
@@ -238,6 +259,7 @@ pub async fn join(shared: Shared, transport: Arc<Net>, code: &str) -> Result<Roo
             call: None,
             data_dir: d.data_dir.clone(),
             over_tor: d.net.is_tor(),
+            fault_armed: None,
         };
         room.system(
             &ev,

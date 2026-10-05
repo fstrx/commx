@@ -480,3 +480,137 @@ fn voice_falls_back_to_tcp_without_udp() {
     wait_link(&mut b, &room, "tcp");
     voice_both_ways(&mut a, &mut b, &room);
 }
+
+// ---- Fault containment: no single peer, room, transfer, or UI operation may
+// terminate the daemon. Faults are injected via a debug-only IPC request.
+
+fn fault(n: &mut Node, scope: &str, room: Option<&str>) {
+    n.req(json!({"op": "debug_fault", "scope": scope, "room_id": room}));
+}
+
+fn assert_alive(n: &mut Node) {
+    n.req(json!({"op": "status"}));
+    n.expect("daemon still alive", 5, |v| v["ev"] == "status");
+    assert!(n.child.try_wait().unwrap().is_none(), "daemon process exited");
+}
+
+#[test]
+fn panicking_ui_request_is_an_error_not_a_crash() {
+    let mut a = Node::spawn("ff-ipc");
+    a.alias("alice");
+    fault(&mut a, "ipc", None);
+    let v = a.expect("contained error", 5, |v| v["ev"] == "error");
+    assert!(v["msg"].as_str().unwrap().contains("contained"), "{v}");
+    assert_alive(&mut a);
+    // The same client keeps working.
+    a.room("after", "HostOnly", 15, false);
+}
+
+#[test]
+fn room_fault_destroys_only_that_room() {
+    let (mut a, mut b, mut c) = (Node::spawn("ff-a"), Node::spawn("ff-b"), Node::spawn("ff-c"));
+    a.alias("alice");
+    b.alias("bob");
+    c.alias("carol");
+    let (bad, code) = a.room("bad", "HostOnly", 15, false);
+    b.join(&code);
+    let (good, code) = a.room("good", "HostOnly", 15, false);
+    c.join(&code);
+
+    // Next message from bob panics alice's handler for room "bad".
+    fault(&mut a, "wire", Some(&bad));
+    a.expect("armed", 5, |v| v["ev"] == "ok");
+    b.send(&bad, "trigger");
+    assert!(a.expect_nuked(&bad, 5).contains("internal fault"));
+    assert!(b.expect_nuked(&bad, 5).contains("host nuked"), "peers told, not left hanging");
+
+    // Everything else on the same daemon is untouched.
+    assert_alive(&mut a);
+    c.send(&good, "still fine?");
+    a.expect_msg("carol", "still fine?");
+    a.send(&good, "yes");
+    c.expect_msg("alice", "yes");
+}
+
+#[test]
+fn room_tick_fault_destroys_only_that_room() {
+    let (mut a, mut b, mut c) = (Node::spawn("ft-a"), Node::spawn("ft-b"), Node::spawn("ft-c"));
+    a.alias("alice");
+    b.alias("bob");
+    c.alias("carol");
+    let (bad, code) = a.room("bad", "HostOnly", 3, false);
+    b.join(&code);
+    let (good, code) = a.room("good", "HostOnly", 3, false);
+    c.join(&code);
+    fault(&mut a, "tick", Some(&bad));
+    assert!(a.expect_nuked(&bad, 5).contains("internal fault"));
+    // "good" keeps its heartbeats: well past its 3 s grace, carol is still in.
+    std::thread::sleep(Duration::from_secs(5));
+    c.send(&good, "alive");
+    a.expect_msg("carol", "alive");
+}
+
+#[test]
+fn crashed_kill_switch_ticker_is_restarted() {
+    let (mut a, mut b) = (Node::spawn("fk-a"), Node::spawn("fk-b"));
+    a.alias("alice");
+    b.alias("bob");
+    let (room, code) = a.room("r", "AnyMember", 3, false);
+    b.join(&code);
+    fault(&mut a, "tick-task", None);
+    a.expect("armed", 5, |v| v["ev"] == "ok");
+    std::thread::sleep(Duration::from_secs(2));
+    assert_alive(&mut a);
+    // If the ticker hadn't come back, liveness checks would be dead and a
+    // frozen member would never be noticed.
+    unsafe { libc::kill(b.child.id() as i32, libc::SIGSTOP) };
+    assert!(a.expect_nuked(&room, 10).contains("timed out"));
+}
+
+#[test]
+fn hostile_network_input_cannot_kill_the_daemon() {
+    use std::io::Write as _;
+    let (mut a, mut b) = (Node::spawn("fh-a"), Node::spawn("fh-b"));
+    a.alias("alice");
+    b.alias("bob");
+    let (room, code) = a.room("r", "HostOnly", 15, false);
+    let addr = commx_core::invite::Invite::decode(&code).unwrap().addr;
+    b.join(&code);
+
+    let mut x: u64 = 0x1234_5678;
+    let mut junk = |n: usize| {
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect::<Vec<u8>>()
+    };
+    // Garbage, oversized length prefixes, and half-open handshakes on TCP.
+    let mut held = Vec::new();
+    for i in 0..60 {
+        if let Ok(mut s) = std::net::TcpStream::connect(&addr) {
+            let _ = match i % 3 {
+                0 => s.write_all(&junk(4096)),
+                1 => s.write_all(&[0xff, 0xff, 0xff, 0xff]),
+                _ => Ok(()),
+            };
+            held.push(s);
+        }
+    }
+    // Garbage and truncated datagrams on UDP.
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    for n in [0usize, 1, 8, 40, 48, 300, 1200, 1500] {
+        for _ in 0..20 {
+            let _ = udp.send_to(&junk(n), &addr);
+        }
+    }
+    drop(held);
+    std::thread::sleep(Duration::from_millis(500));
+
+    assert_alive(&mut a);
+    b.send(&room, "unbothered");
+    a.expect_msg("bob", "unbothered");
+}

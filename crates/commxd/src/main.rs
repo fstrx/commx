@@ -13,6 +13,7 @@ mod killswitch;
 mod net;
 mod power;
 mod state;
+mod supervise;
 mod transport;
 mod udp;
 
@@ -132,6 +133,7 @@ fn detach() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     commx_core::secmem::harden_process();
+    supervise::install_panic_hook();
     let args = Args::parse();
     #[cfg(windows)]
     if args.detach {
@@ -178,12 +180,23 @@ async fn main() -> Result<()> {
     }
     eprintln!("commxd up: {} · control {endpoint}", transport.label());
 
+    // Core service loops run supervised: if one dies it's restarted, and the
+    // daemon (with every room on it) keeps going. See supervise.rs.
     {
         let (shared, transport) = (shared.clone(), transport.clone());
+        let tcp = Arc::new(tcp);
         let preauth = Arc::new(Semaphore::new(MAX_PREAUTH));
-        tokio::spawn(async move {
-            loop {
-                if let Ok(stream) = transport.accept(&tcp).await {
+        supervise::supervise("peer listener", move || {
+            let (shared, transport, tcp, preauth) = (shared.clone(), transport.clone(), tcp.clone(), preauth.clone());
+            async move {
+                loop {
+                    let stream = match transport.accept(&tcp).await {
+                        Ok(s) => s,
+                        Err(_) => {
+                            supervise::io_backoff().await;
+                            continue;
+                        }
+                    };
                     // Shed load instead of queueing unauthenticated strangers.
                     let Ok(permit) = preauth.clone().try_acquire_owned() else { continue };
                     tokio::spawn(net::handle_inbound(shared.clone(), transport.clone(), stream, permit));
@@ -191,14 +204,23 @@ async fn main() -> Result<()> {
             }
         });
     }
-    tokio::spawn(ipc_server::serve(shared.clone(), transport.clone(), ipc));
+    {
+        let (shared, transport) = (shared.clone(), transport.clone());
+        let ipc = Arc::new(tokio::sync::Mutex::new(ipc));
+        supervise::supervise("control socket", move || {
+            ipc_server::serve(shared.clone(), transport.clone(), ipc.clone())
+        });
+    }
     {
         let shared = shared.clone();
-        tokio::spawn(async move {
-            let mut t = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                t.tick().await;
-                lock(&shared).tick();
+        supervise::supervise("kill-switch ticker", move || {
+            let shared = shared.clone();
+            async move {
+                let mut t = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    t.tick().await;
+                    lock(&shared).tick();
+                }
             }
         });
     }

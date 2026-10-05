@@ -27,6 +27,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::state::{lock, PeerKind, Role, Shared};
+use crate::supervise::{contain, io_backoff, supervise};
 
 /// A path is used for voice only if we heard from the other end this recently.
 pub const FRESH: Duration = Duration::from_secs(3);
@@ -121,21 +122,36 @@ impl UdpPath {
 /// connections use to send.
 pub fn start(shared: Shared, socket: UdpSocket) -> Outbox {
     let socket = Arc::new(socket);
-    let (out, mut rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(OUT_QUEUE);
+    let (out, rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(OUT_QUEUE);
+    // Shared so a restarted sender loop picks up the same queue.
+    let rx = Arc::new(tokio::sync::Mutex::new(rx));
     let tx_sock = socket.clone();
-    tokio::spawn(async move {
-        while let Some((to, d)) = rx.recv().await {
-            let _ = tx_sock.send_to(&d, to).await;
+    supervise("udp sender", move || {
+        let (rx, sock) = (rx.clone(), tx_sock.clone());
+        async move {
+            let mut rx = rx.lock().await;
+            while let Some((to, d)) = rx.recv().await {
+                let _ = sock.send_to(&d, to).await;
+            }
         }
     });
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 2048];
-        loop {
-            let Ok((n, from)) = socket.recv_from(&mut buf).await else { continue };
-            if !(8 + 24 + 16..=MAX_DATAGRAM).contains(&n) {
-                continue;
+    supervise("udp receiver", move || {
+        let (shared, socket) = (shared.clone(), socket.clone());
+        async move {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let (n, from) = match socket.recv_from(&mut buf).await {
+                    Ok(x) => x,
+                    Err(_) => {
+                        io_backoff().await;
+                        continue;
+                    }
+                };
+                if !(8 + 24 + 16..=MAX_DATAGRAM).contains(&n) {
+                    continue;
+                }
+                on_datagram(&shared, &buf[..n], from);
             }
-            on_datagram(&shared, &buf[..n], from);
         }
     });
     out
@@ -145,6 +161,20 @@ fn on_datagram(shared: &Shared, d: &[u8], from: SocketAddr) {
     let id: [u8; 8] = d[..8].try_into().unwrap();
     let mut daemon = lock(shared);
     let Some((room_id, kind)) = daemon.udp_index.get(&id).copied() else { return };
+    // Fault boundary: a datagram can cost at most its room.
+    if contain(|| handle_datagram(&mut daemon, room_id, kind, id, d, from)).is_err() {
+        daemon.contained_fault(&room_id);
+    }
+}
+
+fn handle_datagram(
+    daemon: &mut crate::state::Daemon,
+    room_id: commx_core::RoomId,
+    kind: PeerKind,
+    id: [u8; 8],
+    d: &[u8],
+    from: SocketAddr,
+) {
     let ev = daemon.events.clone();
     let Some(room) = daemon.rooms.get_mut(&room_id) else {
         daemon.udp_index.remove(&id);

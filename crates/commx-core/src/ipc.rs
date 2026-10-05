@@ -29,6 +29,9 @@ pub enum IpcRequest {
     Hangup { room_id: String },
     /// One encoded 20 ms Opus frame from this client's microphone (hex).
     VoiceOut { room_id: String, opus: String },
+    /// Fault injection for containment tests. Only exists in debug builds.
+    #[cfg(debug_assertions)]
+    DebugFault { scope: String, room_id: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
