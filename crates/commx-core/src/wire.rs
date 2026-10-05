@@ -41,6 +41,10 @@ pub enum WireMsg {
     /// Encrypted file chunk (bulk lane). Relayed by the host, never chained:
     /// its file's signed announcement carries the hash that authenticates it.
     FileChunk { room_id: RoomId, file_id: [u8; 16], idx: u32, nonce: [u8; 24], ct: Vec<u8> },
+    /// Call roster change. Member → host: about itself. Host → all: anyone.
+    CallPresence { room_id: RoomId, call_id: [u8; 16], member: [u8; 32], joined: bool },
+    /// One sealed 20 ms voice frame (media lane: dropped, never queued, when late).
+    Voice { room_id: RoomId, call_id: [u8; 16], from: [u8; 32], seq: u64, nonce: [u8; 24], ct: Vec<u8> },
     /// Host → members: destroy this room now.
     Nuke { room_id: RoomId, sig: Vec<u8> },
     /// Member → host: I'm leaving.

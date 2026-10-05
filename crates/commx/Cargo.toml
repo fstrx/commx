@@ -13,3 +13,6 @@ clap.workspace = true
 ratatui.workspace = true
 directories.workspace = true
 libc.workspace = true
+cpal = "0.18.2"
+opus-head-sys = { version = "0.3.3", default-features = false }
+hex.workspace = true

@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use zeroize::Zeroizing;
 
+use crate::call::Call;
 use crate::files::{BlobReader, FileEntry};
 use crate::power::Power;
 use crate::transport::Net;
@@ -107,9 +108,18 @@ pub struct AliasEntry {
 pub const PEER_QUEUE: usize = 512;
 /// File chunks queued per connection (~2 MiB).
 pub const BULK_QUEUE: usize = 64;
+/// Voice frames queued per connection (~320 ms); late ones are dropped.
+pub const MEDIA_QUEUE: usize = 16;
 /// Member message rate limit: sustained per second, and burst.
 const SUBMIT_RATE: f64 = 5.0;
 const SUBMIT_BURST: f64 = 20.0;
+
+/// Sending halves of a connection's three priority lanes.
+pub struct Lanes {
+    pub ctl: mpsc::Sender<WireMsg>,
+    pub bulk: mpsc::Sender<WireMsg>,
+    pub media: mpsc::Sender<WireMsg>,
+}
 
 /// One live connection. Dropping it closes the channel: the writer drains and
 /// exits, and the dropped cancel sender stops the reader.
@@ -117,6 +127,8 @@ pub struct Peer {
     tx: mpsc::Sender<WireMsg>,
     /// File chunks: awaited (backpressure) instead of try_send.
     bulk: mpsc::Sender<WireMsg>,
+    /// Voice: try_send, and a full queue just drops the frame (it'd be late).
+    media: mpsc::Sender<WireMsg>,
     pub last_seen: Instant,
     overflowed: AtomicBool,
     tokens: f64,
@@ -125,10 +137,12 @@ pub struct Peer {
 }
 
 impl Peer {
-    pub fn new(tx: mpsc::Sender<WireMsg>, bulk: mpsc::Sender<WireMsg>, cancel: oneshot::Sender<()>) -> Self {
+    pub fn new(lanes: Lanes, cancel: oneshot::Sender<()>) -> Self {
+        let Lanes { ctl: tx, bulk, media } = lanes;
         Self {
             tx,
             bulk,
+            media,
             last_seen: Instant::now(),
             overflowed: AtomicBool::new(false),
             tokens: SUBMIT_BURST,
@@ -143,6 +157,10 @@ impl Peer {
         if self.tx.try_send(msg).is_err() {
             self.overflowed.store(true, Ordering::Relaxed);
         }
+    }
+
+    pub fn send_media(&self, msg: WireMsg) {
+        let _ = self.media.try_send(msg);
     }
 
     pub fn bulk(&self) -> mpsc::Sender<WireMsg> {
@@ -208,6 +226,8 @@ pub struct Room {
     pub files: HashMap<[u8; 16], FileEntry>,
     pub next_file_no: u32,
     pub data_dir: PathBuf,
+    /// At most one call per room; dropping it wipes the call key.
+    pub call: Option<Call>,
 }
 
 /// Work the connection task does after releasing the lock.
@@ -355,6 +375,7 @@ impl Room {
                 self.files.insert(*file_id, entry);
                 self.system(ev, format!("📎 {from} is sharing #{no} '{name}' ({size})"));
             }
+            Body::Call { call_id, nonce, ct } => self.apply_call(ev, p, call_id, nonce, ct)?,
             Body::Leave { sign_pk } => {
                 if !from_host {
                     bail!("leave not from host");
@@ -369,7 +390,7 @@ impl Room {
     }
 
     /// Host: sequence a payload, fan it out, show it locally.
-    fn publish(&mut self, ev: &Events, payload: Payload) -> Result<()> {
+    pub fn publish(&mut self, ev: &Events, payload: Payload) -> Result<()> {
         let block = self.chain.append(&self.me, payload);
         self.send_all(&WireMsg::Block(block.clone()));
         self.apply_block(ev, &block)
@@ -408,6 +429,7 @@ impl Room {
                 Body::File { file_id, nonce, ct } => {
                     !self.files.contains_key(file_id) && self.open_file_meta(&payload, file_id, nonce, ct).is_ok()
                 }
+                Body::Call { call_id, nonce, ct } => self.open_call_meta(&payload, call_id, nonce, ct).is_ok(),
                 _ => false,
             };
         if ok {
@@ -625,6 +647,7 @@ impl Daemon {
             onion,
             files: HashMap::new(),
             next_file_no: 0,
+            call: None,
             data_dir: self.data_dir.clone(),
         };
         room.keys.insert(0, RoomKey::generate());

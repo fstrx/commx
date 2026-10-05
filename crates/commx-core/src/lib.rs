@@ -11,6 +11,7 @@ pub mod local_ipc;
 pub mod room;
 pub mod secmem;
 pub mod text;
+pub mod voice;
 pub mod wire;
 
 pub type RoomId = [u8; 16];

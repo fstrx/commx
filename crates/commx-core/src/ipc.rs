@@ -24,6 +24,11 @@ pub enum IpcRequest {
     Files { room_id: String },
     /// Export a decrypted copy of file `no` to `dest` (never overwrites).
     SaveFile { room_id: String, no: u32, dest: String },
+    /// Start a call in the room, or join the one already running.
+    Call { room_id: String },
+    Hangup { room_id: String },
+    /// One encoded 20 ms Opus frame from this client's microphone (hex).
+    VoiceOut { room_id: String, opus: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +52,12 @@ pub struct FileInfo {
     pub from: String,
     /// "sending", "receiving 40%", "ready", "sent", "failed: ..."
     pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallInfo {
+    pub participants: Vec<String>,
+    pub joined: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,4 +98,8 @@ pub enum IpcEvent {
     History { room_id: String, lines: Vec<ChatLine> },
     Nuked { room_id: String, name: String, reason: String },
     Files { room_id: String, list: Vec<FileInfo> },
+    /// Call state changed; `None` when there's no call in the room.
+    Call { room_id: String, call: Option<CallInfo> },
+    /// Opus frame from someone in a call we've joined (hex).
+    VoiceIn { room_id: String, from: String, seq: u64, opus: String },
 }

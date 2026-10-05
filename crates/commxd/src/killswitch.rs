@@ -24,8 +24,17 @@ impl Daemon {
         let ev = self.events.clone();
         let Some(room) = self.rooms.get_mut(&room_id) else { return Followup::default() };
         room.touch(kind);
-        if matches!(msg, WireMsg::FileChunk { .. }) {
-            return room.on_chunk(kind, msg);
+        match msg {
+            WireMsg::FileChunk { .. } => return room.on_chunk(kind, msg),
+            WireMsg::Voice { .. } => {
+                room.on_voice(&ev, kind, msg);
+                return Followup::default();
+            }
+            WireMsg::CallPresence { call_id, member, joined, .. } => {
+                room.on_presence(&ev, kind, call_id, member, joined);
+                return Followup::default();
+            }
+            _ => {}
         }
         let after = match (kind, msg) {
             (PeerKind::Member(pk), WireMsg::Submit(p)) => {
@@ -90,6 +99,7 @@ impl Daemon {
                 if peers.remove(&pk).is_none() {
                     return;
                 }
+                room.call_member_gone(&ev, pk);
                 let name = room
                     .members
                     .iter()

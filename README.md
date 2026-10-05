@@ -1,6 +1,6 @@
 # commx
 
-commx is peer-to-peer chat and file sharing for small groups of friends. Everything is end-to-end encrypted. There are no servers, no accounts and no phone numbers, only aliases. Rooms self-destruct when nodes drop. It runs over Tor, or over direct TCP for a LAN or VPN.
+commx is peer-to-peer chat, voice calls and file sharing for small groups of friends. Everything is end-to-end encrypted. There are no servers, no accounts and no phone numbers, only aliases. Rooms self-destruct when nodes drop. It runs over Tor, or over direct TCP for a LAN or VPN.
 
 ```
  commx (TUI) ──private socket / pipe── commxd ──Noise_XX over TCP or Tor── other commxd nodes
@@ -39,6 +39,7 @@ Tor mode needs a `tor` binary on your PATH. On macOS that's `brew install tor`; 
 /join cx1:...                       join a friend's room
 /send ~/notes.pdf                   share a file (max 256 MiB)
 /files   /save 1 [path]             list files / export a decrypted copy
+/call    /hangup   /mute            start or join the room's voice call / leave / mute
 /nuke    /nuke all                  destroy this room / everything
 ```
 
@@ -79,6 +80,21 @@ Each room chooses its kill mode when it's created. Every member enforces the hos
   - Blob names, sizes and contents say nothing about the file.
   - The file key exists only in RAM, so after a nuke (or a crash) a blob is noise. Blobs are unlinked on nuke, and orphans are purged at startup.
 - **Export.** `/save` checks the hash and writes a decrypted copy. That copy is yours, and commx can't nuke it.
+
+## Voice calls
+
+`/call` starts a call in the current room, or joins the one already running. The voice stack doesn't use WebRTC, ICE or STUN, so there's nothing in it that can leak your IP. It's built on the same keys and connections as chat.
+
+- **Signaling.** A call starts with a signed entry in the room's hash chain carrying a fresh call key, sealed under the room key. There's no signaling server to trust.
+- **Encryption.** Audio is Opus at 24 kb/s. Every 20 ms frame is sealed with XChaCha20-Poly1305 under the call key, and has a replay window.
+- **Group calls.** The host relays frames on a priority lane and doesn't mix them; each listener mixes locally.
+- **What leaks: nothing about speech.**
+  - The encoder runs in hard CBR and every frame is padded to the same size, so packet sizes can't leak words.
+  - You send continuously while in a call, silence and mute included, so nobody can tell *when* you talk.
+  - Cost: about 30 kb/s per participant.
+- **Tor.** Calls work in Tor mode, with roughly walkie-talkie latency (0.5–1.5 s). The jitter buffer adapts and Opus conceals lost frames. Direct TCP on a LAN or VPN gives near-real-time calls.
+- **Microphone permission.** Audio runs in the `commx` TUI, so your OS asks for microphone permission for your terminal app. The daemon holds the keys.
+- **Headphones.** Use them. There's no echo cancellation yet.
 
 ## Memory hardening
 

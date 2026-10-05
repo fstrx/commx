@@ -118,6 +118,22 @@ fn room(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(format!("kill:{} {}s ", r.kill_mode.label(), r.grace_secs), mode_style),
         Span::styled(format!("· {} ", r.members.join(", ")), Style::default().fg(DIM)),
     ]);
+    let title = match app.calls.get(&r.room_id) {
+        Some(c) => {
+            let mut t = title;
+            let status = match (c.joined, app.muted) {
+                (true, true) => " · in call, muted",
+                (true, false) => " · in call",
+                (false, _) => " · /call to join",
+            };
+            t.spans.push(Span::styled(
+                format!("📞 {}{status} ", c.participants.join(", ")),
+                Style::default().fg(ACCENT).bold(),
+            ));
+            t
+        }
+        None => title,
+    };
     // Decrypt only what can be on screen; it's dropped (and wiped) after drawing.
     let rows = area.height.saturating_sub(2) as usize;
     let visible: Vec<ChatLine> = app.lines.get(&r.room_id).map(|l| l.tail(rows, app.scroll)).unwrap_or_default();

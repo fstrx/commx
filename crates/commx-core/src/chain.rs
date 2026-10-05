@@ -23,6 +23,8 @@ pub enum Body {
     Join { member: MemberInfo },
     /// File announcement: postcard `FileMeta` sealed under the room key of `epoch`.
     File { file_id: [u8; 16], nonce: [u8; 24], ct: Vec<u8> },
+    /// Call start: postcard `voice::CallMeta` sealed under the room key of `epoch`.
+    Call { call_id: [u8; 16], nonce: [u8; 24], ct: Vec<u8> },
     Leave { sign_pk: [u8; 32] },
 }
 

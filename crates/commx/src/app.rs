@@ -1,7 +1,7 @@
 //! Client state: mirrors what the daemon tells us. Holds nothing the daemon
 //! doesn't already have, and forgets a room's lines the moment it's nuked.
 
-use commx_core::ipc::{ChatLine, IpcEvent, IpcRequest, RoomSummary};
+use commx_core::ipc::{CallInfo, ChatLine, IpcEvent, IpcRequest, RoomSummary};
 use commx_core::secmem::SealedLog;
 use std::collections::{HashMap, HashSet};
 
@@ -68,6 +68,9 @@ pub struct App {
     pub notice: Option<Notice>,
     pub scroll: usize,
     pub quit: bool,
+    /// Call state per room, as reported by the daemon.
+    pub calls: HashMap<String, CallInfo>,
+    pub muted: bool,
 }
 
 impl App {
@@ -84,6 +87,8 @@ impl App {
             notice: None,
             scroll: 0,
             quit: false,
+            calls: HashMap::new(),
+            muted: false,
         };
         app.log("commx · end-to-end encrypted, memory-only chat. Nothing here touches disk.", false);
         app.log("Start: /alias new <name> --ephemeral  (or /unlock for saved aliases)", false);
@@ -91,6 +96,11 @@ impl App {
             app.log(*h, false);
         }
         app
+    }
+
+    /// The room whose call we're in (at most one; the daemon allows one per room).
+    pub fn call_room(&self) -> Option<String> {
+        self.calls.iter().find(|(_, c)| c.joined).map(|(id, _)| id.clone())
     }
 
     pub fn current(&self) -> Option<&RoomSummary> {
@@ -213,6 +223,16 @@ impl App {
                     log.push(l);
                 }
             }
+            IpcEvent::Call { room_id, call } => match call {
+                Some(c) => {
+                    self.calls.insert(room_id, c);
+                }
+                None => {
+                    self.calls.remove(&room_id);
+                }
+            },
+            // Audio goes straight to the engine in main; never stored.
+            IpcEvent::VoiceIn { .. } => {}
             IpcEvent::Files { room_id, list } => {
                 if list.is_empty() {
                     self.local_line(&room_id, "no files in this room".into());
@@ -227,6 +247,7 @@ impl App {
                 self.rooms.retain(|r| r.room_id != room_id);
                 self.lines.remove(&room_id);
                 self.unread.remove(&room_id);
+                self.calls.remove(&room_id);
                 if cur.as_deref() == Some(&room_id) {
                     self.select(0);
                 } else if let Some(cur) = cur {
@@ -326,6 +347,28 @@ impl App {
                 }
                 None => need_room(self),
             },
+            Command::Call => match room {
+                Some(room_id) => {
+                    if self.call_room().is_some_and(|r| r != room_id) {
+                        self.notify("hang up your other call first", true);
+                        return Vec::new();
+                    }
+                    vec![IpcRequest::Call { room_id }]
+                }
+                None => need_room(self),
+            },
+            Command::Hangup => match self.call_room() {
+                Some(room_id) => vec![IpcRequest::Hangup { room_id }],
+                None => {
+                    self.notify("you're not in a call", true);
+                    Vec::new()
+                }
+            },
+            Command::Mute => {
+                self.muted = !self.muted;
+                self.notify(if self.muted { "microphone muted (still sending silence)" } else { "microphone on" }, false);
+                Vec::new()
+            }
             Command::Nuke { all: true } => vec![IpcRequest::Nuke { room_id: None }],
             Command::Nuke { all: false } => match room {
                 Some(room_id) => vec![IpcRequest::Nuke { room_id: Some(room_id) }],

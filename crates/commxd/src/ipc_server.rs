@@ -212,6 +212,31 @@ async fn handle(
             tokio::task::spawn_blocking(move || reader.export(&out)).await??;
             ok(tx, format!("saved #{no} to {} (decrypted copy — commx can't nuke it)", dest.display()));
         }
+        IpcRequest::Call { room_id } => {
+            let id = room_arg(&room_id)?;
+            let mut d = lock(shared);
+            let ev = d.events.clone();
+            let room = d.rooms.get_mut(&id).ok_or_else(|| anyhow!("no such room"))?;
+            match room.call_info() {
+                Some(c) if c.joined => return Err(anyhow!("you're already in the call")),
+                Some(_) => room.set_my_presence(&ev, true)?,
+                None => room.start_call(&ev)?,
+            }
+        }
+        IpcRequest::Hangup { room_id } => {
+            let id = room_arg(&room_id)?;
+            let mut d = lock(shared);
+            let ev = d.events.clone();
+            let room = d.rooms.get_mut(&id).ok_or_else(|| anyhow!("no such room"))?;
+            room.set_my_presence(&ev, false)?;
+        }
+        IpcRequest::VoiceOut { room_id, opus } => {
+            let id = room_arg(&room_id)?;
+            let opus = Zeroizing::new(hex::decode(opus).map_err(|_| anyhow!("bad voice frame"))?);
+            if let Some(room) = lock(shared).rooms.get_mut(&id) {
+                room.send_voice(&opus)?;
+            }
+        }
         IpcRequest::Nuke { room_id: None } => {
             lock(shared).nuke_all("nuked by you");
             ok(tx, "everything nuked");

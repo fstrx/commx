@@ -24,14 +24,30 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit};
 
 use crate::files::hash_file;
-use crate::state::{lock, Followup, Peer, PeerKind, Role, Room, Shared, BULK_QUEUE, MAX_LINES, PEER_QUEUE};
+use crate::state::{
+    lock, Followup, Lanes, Peer, PeerKind, Role, Room, Shared, BULK_QUEUE, MAX_LINES, MEDIA_QUEUE, PEER_QUEUE,
+};
 use commx_core::secmem::SealedLog;
 use crate::transport::{Net, SecureReader, SecureWriter};
 
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Control frames always go first; file chunks fill the gaps.
-async fn writer_task(mut ctl: mpsc::Receiver<WireMsg>, mut bulk: mpsc::Receiver<WireMsg>, mut w: SecureWriter) {
+/// Receiving halves for the writer: (control, media, bulk).
+type LaneRx = (mpsc::Receiver<WireMsg>, mpsc::Receiver<WireMsg>, mpsc::Receiver<WireMsg>);
+
+/// The three lanes of one connection: senders for the Peer, receivers for the writer.
+fn lanes() -> (Lanes, LaneRx) {
+    let (ctl, ctl_rx) = mpsc::channel(PEER_QUEUE);
+    let (bulk, bulk_rx) = mpsc::channel(BULK_QUEUE);
+    let (media, media_rx) = mpsc::channel(MEDIA_QUEUE);
+    (Lanes { ctl, bulk, media }, (ctl_rx, media_rx, bulk_rx))
+}
+
+/// Control frames first, then voice, then file chunks.
+async fn writer_task(
+    (mut ctl, mut media, mut bulk): LaneRx,
+    mut w: SecureWriter,
+) {
     loop {
         let msg = tokio::select! {
             biased;
@@ -39,6 +55,7 @@ async fn writer_task(mut ctl: mpsc::Receiver<WireMsg>, mut bulk: mpsc::Receiver<
                 Some(m) => m,
                 None => break,
             },
+            Some(m) = media.recv() => m,
             Some(m) = bulk.recv() => m,
         };
         if w.send(&msg).await.is_err() {
@@ -113,18 +130,18 @@ pub async fn handle_inbound(
     else {
         return;
     };
-    let (tx, rx) = mpsc::channel(PEER_QUEUE);
-    let (bulk_tx, bulk_rx) = mpsc::channel(BULK_QUEUE);
+    let (lanes, rxs) = lanes();
+    let tx = lanes.ctl.clone();
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let sign_pk = member.id.sign_pk;
-    let peer = Peer::new(tx.clone(), bulk_tx, cancel_tx);
+    let peer = Peer::new(lanes, cancel_tx);
     let res = lock(&shared).admit(room_id, token, member, &sig, &conn.handshake_hash, peer);
     if let Err(reason) = &res {
         let _ = tx.try_send(WireMsg::JoinDenied { reason: reason.clone() });
     }
     drop(tx);
     drop(permit);
-    tokio::spawn(writer_task(rx, bulk_rx, conn.writer));
+    tokio::spawn(writer_task(rxs, conn.writer));
     if res.is_ok() {
         reader_loop(shared, reader, cancel_rx, room_id, PeerKind::Member(sign_pk)).await;
     }
@@ -173,8 +190,7 @@ pub async fn join(shared: Shared, transport: Arc<Net>, code: &str) -> Result<Roo
     }
     let key = RoomKey::from_bytes(&open_sealed(&me, &sealed_key).map_err(|_| anyhow!("can't open room key"))?)?;
 
-    let (tx, rx) = mpsc::channel(PEER_QUEUE);
-    let (bulk_tx, bulk_rx) = mpsc::channel(BULK_QUEUE);
+    let (lanes, rxs) = lanes();
     let (cancel_tx, cancel_rx) = oneshot::channel();
     // Everything the host told us about the room is displayed; scrub it.
     let mut cfg = cfg;
@@ -195,12 +211,13 @@ pub async fn join(shared: Shared, transport: Arc<Net>, code: &str) -> Result<Roo
             keys: HashMap::from([(epoch, key)]),
             epoch,
             lines: SealedLog::new(MAX_LINES),
-            role: Role::Member { host: Peer::new(tx, bulk_tx, cancel_tx) },
+            role: Role::Member { host: Peer::new(lanes, cancel_tx) },
             last_hb: Instant::now(),
             addr: String::new(),
             onion: None,
             files: HashMap::new(),
             next_file_no: 0,
+            call: None,
             data_dir: d.data_dir.clone(),
         };
         room.system(
@@ -217,7 +234,7 @@ pub async fn join(shared: Shared, transport: Arc<Net>, code: &str) -> Result<Roo
         d.rooms.insert(invite.room_id, room);
         d.refresh_power();
     }
-    tokio::spawn(writer_task(rx, bulk_rx, writer));
+    tokio::spawn(writer_task(rxs, writer));
     tokio::spawn(reader_loop(shared, reader, cancel_rx, invite.room_id, PeerKind::Host));
     Ok(invite.room_id)
 }

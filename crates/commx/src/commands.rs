@@ -17,6 +17,9 @@ pub enum Command {
     SendFile(String),
     Files,
     Save { no: u32, dest: Option<String> },
+    Call,
+    Hangup,
+    Mute,
     Status,
     Quit,
     Say(String),
@@ -35,6 +38,8 @@ pub const HELP: &[&str] = &[
     "/send <path>                      share a file with this room (max 256 MiB)",
     "/files                            list this room's files",
     "/save <n> [path]                  export file #n decrypted (default: Downloads)",
+    "/call                             start or join this room's voice call",
+    "/hangup   /mute                   leave the call / toggle your microphone",
     "/nuke                             destroy this room (host: for everyone)",
     "/nuke all                         destroy everything, now",
     "/status   /help   /quit",
@@ -99,6 +104,9 @@ pub fn parse(input: &str) -> Result<Command, String> {
             Ok(Command::Save { no, dest: (!dest.is_empty()).then(|| dest.join(" ")) })
         }
         ("/save", _) => usage("/save <n> [path]"),
+        ("/call" | "/vc", _) => Ok(Command::Call),
+        ("/hangup" | "/leave", _) => Ok(Command::Hangup),
+        ("/mute" | "/unmute", _) => Ok(Command::Mute),
         ("/nuke", []) => Ok(Command::Nuke { all: false }),
         ("/nuke", ["all"]) => Ok(Command::Nuke { all: true }),
         ("/nuke", _) => usage("/nuke [all]"),

@@ -384,3 +384,41 @@ fn file_shared_through_host_then_nuked_off_disk() {
         assert_eq!(left, 0, "blobs survived the nuke");
     }
 }
+
+#[test]
+fn call_routes_voice_only_to_participants() {
+    let (mut a, mut b, mut c) = (Node::spawn("c-a"), Node::spawn("c-b"), Node::spawn("c-c"));
+    a.alias("alice");
+    b.alias("bob");
+    c.alias("carol");
+    let (room, code) = a.room("vc", "HostOnly", 15, false);
+    b.join(&code);
+    let code = a.invite(&room);
+    c.join(&code);
+
+    // A member starts the call (goes through the host's chain).
+    b.req(json!({"op": "call", "room_id": room}));
+    a.expect_system("bob started a call");
+    a.req(json!({"op": "call", "room_id": room}));
+    b.expect_system("alice joined the call");
+    c.expect("roster", 5, |v| {
+        v["ev"] == "call" && v["call"]["participants"].as_array().is_some_and(|p| p.len() == 2) && v["call"]["joined"] == false
+    });
+
+    let frame = |i: u8| hex::encode([i; 60]);
+    for i in 0..5u8 {
+        a.req(json!({"op": "voice_out", "room_id": room, "opus": frame(i)}));
+        b.req(json!({"op": "voice_out", "room_id": room, "opus": frame(100 + i)}));
+    }
+    for i in 0..5u8 {
+        b.expect("voice from alice", 5, |v| v["ev"] == "voice_in" && v["from"] == "alice" && v["opus"] == frame(i));
+        a.expect("voice from bob", 5, |v| v["ev"] == "voice_in" && v["from"] == "bob" && v["opus"] == frame(100 + i));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(c.rx.try_iter().all(|v| v["ev"] != "voice_in"), "non-participant got audio");
+
+    b.req(json!({"op": "hangup", "room_id": room}));
+    a.expect_system("bob left the call");
+    a.req(json!({"op": "hangup", "room_id": room}));
+    c.expect_system("call ended");
+}

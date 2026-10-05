@@ -5,8 +5,11 @@
 static ALLOC: commx_core::secmem::ZeroizingAlloc = commx_core::secmem::ZeroizingAlloc;
 
 mod app;
+mod codec;
 mod commands;
+mod dsp;
 mod ui;
+mod voice;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -99,17 +102,64 @@ async fn main() -> Result<()> {
     let mut app = App::new();
     // Refresh status (tor bootstrap, keep-awake) periodically.
     let mut refresh = tokio::time::interval(Duration::from_secs(3));
+    // Encoded microphone frames from the audio thread.
+    let (mic_tx, mut mic_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let mut engine: Option<(String, voice::VoiceEngine)> = None;
+    // Don't retry opening devices for a call we just bailed out of.
+    let mut audio_failed: Option<String> = None;
+    let mut redraw = true;
     let result: Result<()> = async {
         loop {
-            terminal.draw(|f| ui::draw(f, &app))?;
-            let reqs = tokio::select! {
+            if redraw {
+                terminal.draw(|f| ui::draw(f, &app))?;
+            }
+            redraw = true;
+            let mut reqs = tokio::select! {
                 _ = refresh.tick() => vec![IpcRequest::Status],
                 ev = ev_rx.recv() => match ev {
+                    Some(IpcEvent::VoiceIn { room_id, from, seq, opus }) => {
+                        redraw = false;
+                        if let (Some((r, e)), Ok(pkt)) = (&engine, hex::decode(&opus)) {
+                            if *r == room_id {
+                                e.push(&from, seq, pkt);
+                            }
+                        }
+                        Vec::new()
+                    }
                     Some(ev) => app.on_event(ev),
                     None => bail!("daemon connection closed"),
                 },
+                Some(pkt) = mic_rx.recv() => {
+                    redraw = false;
+                    match &engine {
+                        Some((room_id, _)) => vec![IpcRequest::VoiceOut { room_id: room_id.clone(), opus: hex::encode(pkt) }],
+                        None => Vec::new(),
+                    }
+                }
                 Some(ev) = key_rx.recv() => on_input(&mut app, ev),
             };
+            // Audio follows the daemon's roster: open devices when we're in a
+            // call, close them (and drop all buffered audio) when we're not.
+            let want = app.call_room();
+            if want.is_none() {
+                audio_failed = None;
+            }
+            if engine.as_ref().map(|(r, _)| r) != want.as_ref() && audio_failed != want {
+                engine = None;
+                if let Some(room_id) = want {
+                    match voice::VoiceEngine::start(mic_tx.clone(), app.muted) {
+                        Ok(e) => engine = Some((room_id, e)),
+                        Err(e) => {
+                            app.on_event(IpcEvent::Error { msg: format!("audio: {e:#}") });
+                            audio_failed = Some(room_id.clone());
+                            reqs.push(IpcRequest::Hangup { room_id });
+                        }
+                    }
+                }
+            }
+            if let Some((_, e)) = &engine {
+                e.set_muted(app.muted);
+            }
             for req in reqs {
                 send(&mut w, &req).await?;
             }

@@ -6,6 +6,7 @@
 #[global_allocator]
 static ALLOC: commx_core::secmem::ZeroizingAlloc = commx_core::secmem::ZeroizingAlloc;
 
+mod call;
 mod files;
 mod ipc_server;
 mod killswitch;

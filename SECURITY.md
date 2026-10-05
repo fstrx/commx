@@ -37,6 +37,8 @@ Findings from reviewing the MVP, all fixed in commit `5a48646` unless noted. Reg
 
 - **Invites are bearer tokens.** They're single use and last 10 minutes, but anyone who intercepts one first can join. Check the fingerprints shown on join.
 - **No reconnect.** A real disconnect is a drop, by design.
+- **Voice frames aren't signed per sender.** They're authenticated as "someone holding the call key". A malicious participant, or the host, could inject audio attributed to someone else. Chat messages and files *are* signed. Per-frame signatures would roughly double call bandwidth.
+- **The host relays every call frame.** As a room member it can listen if it joins, and it sees who's in the call. Frame sizes and timing reveal nothing about speech.
 - **Windows is compile-checked here and tested in CI,** but hasn't had hands-on testing yet.
 - **Tor mode stores tor's consensus/guard cache** in `<data-dir>/tor`. That reveals commx used Tor, but nothing about rooms.
 - **Exported files (`/save`) are plaintext** and outside commx's control.
