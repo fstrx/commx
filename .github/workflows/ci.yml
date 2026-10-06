@@ -5,6 +5,8 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  # "Run workflow" button on GitHub: rebuild everything (incl. the APK) on demand.
+  workflow_dispatch:
 
 jobs:
   test:
