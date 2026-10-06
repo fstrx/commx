@@ -9,7 +9,7 @@ commx is peer-to-peer chat, voice calls and file sharing for small groups of fri
 - **`commxd`** is the node. It runs in the background, holds keys and rooms in locked memory, and talks to peers.
 - **`commx`** is the terminal client. It talks only to your local `commxd`.
 
-It runs on macOS, Linux and Windows. Android is planned.
+It runs on macOS, Linux, Windows and Android.
 
 ## Install
 
@@ -32,6 +32,20 @@ Tor mode needs a `tor` binary on your PATH. On macOS that's `brew install tor`; 
 2. Run `powershell -ExecutionPolicy Bypass -File install-windows.ps1`. This installs to `%LOCALAPPDATA%\commx`, starts `commxd` hidden at logon and adds `commx` to your PATH.
 3. Open a new terminal (Windows Terminal recommended) and run `commx`.
 4. For Tor mode, install the Tor Expert Bundle. Then add `--tor --tor-bin C:\path\to\tor.exe` to the `commxd` Startup shortcut.
+
+### Android
+
+Install `commx-android.apk` from a release (Android 8.0+, arm64 or x86_64). It's a native app built on the same Rust core: the daemon runs inside the app as a foreground service, and the UI is Jetpack Compose.
+- **Layout:** two panes on tablets, one on phones. With a hardware keyboard, Enter sends and every `/command` from the TUI works.
+- **Background:** the node keeps running with the screen off. While a room is open the app holds a wake lock and a Wi-Fi lock, because a sleeping node would trip the kill switch. "Quit & nuke all" in the notification shuts everything down.
+- **Calls:** call, mute and hold-to-talk buttons. The microphone permission is requested the first time you call.
+- **Privacy:**
+  - Screenshots, screen recording and the recent-apps thumbnail are blocked.
+  - No backups: nothing is in cloud or adb backups.
+  - The notification never shows room names or messages.
+  - Invites are copied as "sensitive", so clipboard previews hide them.
+- **Not on Android yet:** Tor mode, and sending or saving files. Receiving still works.
+- **Updates:** builds without a configured release key are signed with a throwaway key, and Android refuses to install an update signed with a different key. See [Develop](#develop) to set up a stable signing key.
 
 ## Use
 
@@ -165,6 +179,8 @@ See [SECURITY.md](SECURITY.md) for the audit and known limits.
 
 ## Develop
 
+Android: `rustup target add aarch64-linux-android x86_64-linux-android && cargo install cargo-ndk`, then `cd android && ./gradlew assembleRelease`. That builds the Rust core via `build-rust.sh`, then the APK. Release signing is set from the environment: `COMMX_KEYSTORE`, `COMMX_KEYSTORE_PASSWORD`, `COMMX_KEY_ALIAS` and `COMMX_KEY_PASSWORD`. In CI these come from the secrets `COMMX_KEYSTORE_B64` (a base64 keystore) plus the three passwords and alias.
+
 ```sh
 cargo test --workspace                                 # unit + end-to-end (real daemons, SIGKILL/SIGSTOP)
 cargo test -p commxd --test rooms -- --ignored tor     # live Tor test (needs tor + internet)
@@ -175,6 +191,9 @@ cargo clippy --target x86_64-pc-windows-gnu --workspace --all-targets -- -D warn
 crates/commx-core   identities, crypto, hash chain, secmem, local IPC, wire/IPC formats
 crates/commxd       daemon: transports (TCP/Tor), rooms, kill switch, files, power, IPC server
 crates/commx        ratatui TUI
+crates/commx-voice  voice engine (Opus, jitter buffer, mixing, cpal), shared by TUI and Android
+crates/commx-android  JNI bridge: embeds the daemon + voice engine in the Android app
+android/            Android app (Kotlin, Jetpack Compose); build-rust.sh builds the .so files
 dist/               launchd, systemd, Windows installer
 ```
 

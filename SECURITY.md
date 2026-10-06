@@ -49,6 +49,15 @@ A daemon crash is a denial of service against every room on that node, since the
 - Every peer/room/IPC boundary contains panics, and core loops are supervised. See [README → Reliability](README.md#reliability).
 - Release builds switched from `panic = "abort"` to `"unwind"`. Under abort, any panic killed the daemon outright and skipped the destructors that wipe keys.
 
+## Android
+
+- **No control socket.** The daemon runs inside the app, and the UI talks to it over an in-process pipe, so no other app can find or connect to a control endpoint. Voice frames never enter the JVM.
+- **Private storage, no backups.** Data lives in the app-private `filesDir`, and backups are disabled (`allowBackup=false` plus data-extraction rules that exclude everything).
+- **Screen and notification.** `FLAG_SECURE` is set on the window. The notification is `VISIBILITY_SECRET` and carries no room names or content.
+- **Limit: JVM strings can't be wiped.** Message text the UI displays lives in JVM strings until garbage collection. The Rust side (keys, sealed history, IPC buffers) keeps its memory hardening.
+- **Limit: no Tor yet on Android.** Peers see your IP, as in desktop direct mode.
+- **Limit: signing.** Builds without a release key are signed with a throwaway debug key. Only install APKs from the official release page.
+
 ## Known limits
 
 - **Invites are bearer tokens.** They're single use and last 10 minutes, but anyone who intercepts one first can join. Check the fingerprints shown on join.
