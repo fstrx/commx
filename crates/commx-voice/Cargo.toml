@@ -1,0 +1,12 @@
+[package]
+name = "commx-voice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+commx-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+cpal = "0.18.2"
+opus-head-sys = { version = "0.3.3", default-features = false }

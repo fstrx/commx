@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/commx-core", "crates/commxd", "crates/commx"]
+members = ["crates/commx-core", "crates/commx-voice", "crates/commxd", "crates/commx", "crates/commx-android"]
 
 [workspace.package]
 version = "0.2.1"
@@ -9,6 +9,8 @@ license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
 commx-core = { path = "crates/commx-core" }
+commx-voice = { path = "crates/commx-voice" }
+commxd = { path = "crates/commxd" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

@@ -20,19 +20,39 @@ use crate::transport::Net;
 
 const MAX_LINE: usize = 64 * 1024;
 
-/// Accept loop. The listener is shared so a supervised restart reuses it.
-pub async fn serve(shared: Shared, transport: Arc<Net>, listener: Arc<tokio::sync::Mutex<Listener>>) {
-    let mut listener = listener.lock().await;
-    loop {
-        // Listener only yields same-user clients.
-        let (r, w) = match listener.accept().await {
-            Ok(x) => x,
-            Err(_) => {
-                io_backoff().await;
-                continue;
+/// Where control clients come from. Shared so a supervised restart of the
+/// accept loop picks up the same source.
+#[derive(Clone)]
+pub enum ControlSource {
+    Listener(Arc<tokio::sync::Mutex<Listener>>),
+    InProcess(Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(Reader, Writer)>>>),
+}
+
+/// Accept loop for control clients.
+pub async fn serve(shared: Shared, transport: Arc<Net>, source: ControlSource) {
+    match source {
+        ControlSource::Listener(listener) => {
+            let mut listener = listener.lock().await;
+            loop {
+                // Listener only yields same-user clients.
+                let (r, w) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => {
+                        io_backoff().await;
+                        continue;
+                    }
+                };
+                tokio::spawn(client(shared.clone(), transport.clone(), r, w));
             }
-        };
-        tokio::spawn(client(shared.clone(), transport.clone(), r, w));
+        }
+        ControlSource::InProcess(rx) => {
+            let mut rx = rx.lock().await;
+            // Ends when the embedding app drops its sender (it's shutting down).
+            while let Some((r, w)) = rx.recv().await {
+                tokio::spawn(client(shared.clone(), transport.clone(), r, w));
+            }
+            std::future::pending::<()>().await
+        }
     }
 }
 

@@ -5,11 +5,10 @@
 static ALLOC: commx_core::secmem::ZeroizingAlloc = commx_core::secmem::ZeroizingAlloc;
 
 mod app;
-mod codec;
 mod commands;
-mod dsp;
 mod ui;
-mod voice;
+
+use commx_voice as voice;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};

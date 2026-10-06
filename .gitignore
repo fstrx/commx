@@ -1,1 +1,8 @@
 /target
+# Android build outputs (rebuilt from crates/commx-android by android/build-rust.sh)
+/android/app/src/main/jniLibs/
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/.kotlin/
