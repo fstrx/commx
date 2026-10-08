@@ -41,6 +41,11 @@ jobs:
           distribution: temurin
           java-version: 21
       - run: cargo install cargo-ndk --locked
+      # Same NDK as local builds, independent of runner image updates.
+      - name: Android NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;28.2.13676358" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
       - name: Release keystore (optional)
         env:
           KEYSTORE_B64: ${{ secrets.COMMX_KEYSTORE_B64 }}
@@ -54,7 +59,15 @@ jobs:
           COMMX_KEYSTORE_PASSWORD: ${{ secrets.COMMX_KEYSTORE_PASSWORD }}
           COMMX_KEY_ALIAS: ${{ secrets.COMMX_KEY_ALIAS }}
           COMMX_KEY_PASSWORD: ${{ secrets.COMMX_KEY_PASSWORD }}
-        run: cd android && ./gradlew --no-daemon assembleRelease && cp app/build/outputs/apk/release/app-release.apk ../commx-android.apk
+        # On failure, surface the tail of the log as annotations (readable
+        # without logging in to GitHub).
+        run: |
+          cd android
+          if ! ./gradlew --no-daemon assembleRelease > build.log 2>&1; then
+            tail -n 40 build.log | sed 's/^/::error::/'
+            exit 1
+          fi
+          cp app/build/outputs/apk/release/app-release.apk ../commx-android.apk
       - uses: actions/upload-artifact@v4
         with:
           name: commx-android
