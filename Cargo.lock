@@ -412,7 +412,9 @@ dependencies = [
  "data-encoding",
  "directories",
  "ed25519-dalek",
+ "getrandom",
  "hex",
+ "js-sys",
  "libc",
  "postcard",
  "rand",
@@ -437,6 +439,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "commx-web"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "commx-core",
+ "commxd",
+ "hex",
+ "postcard",
+ "serde",
+ "serde_json",
+ "snow",
+ "tokio",
+ "wasm-bindgen",
+ "zeroize",
+]
+
+[[package]]
 name = "commxd"
 version = "0.2.1"
 dependencies = [
@@ -444,12 +463,14 @@ dependencies = [
  "blake3",
  "clap",
  "commx-core",
+ "data-encoding",
  "hex",
  "libc",
  "postcard",
  "rand",
  "serde",
  "serde_json",
+ "sha1",
  "snow",
  "tokio",
  "windows-sys 0.59.0",
@@ -838,8 +859,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "wasi",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1621,6 +1644,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest",
 ]
 
 [[package]]

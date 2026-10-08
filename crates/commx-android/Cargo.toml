@@ -9,7 +9,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-commx-core.workspace = true
+commx-core = { workspace = true, features = ["native"] }
 commx-voice.workspace = true
 commxd.workspace = true
 anyhow.workspace = true

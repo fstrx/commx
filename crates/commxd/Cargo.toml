@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-commx-core.workspace = true
+commx-core = { workspace = true, features = ["native"] }
 anyhow.workspace = true
 serde_json.workspace = true
 rand.workspace = true
@@ -17,6 +17,8 @@ hex.workspace = true
 postcard.workspace = true
 serde.workspace = true
 blake3.workspace = true
+sha1 = "0.10"
+data-encoding.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]

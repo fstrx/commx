@@ -9,7 +9,7 @@ commx is peer-to-peer chat, voice calls and file sharing for small groups of fri
 - **`commxd`** is the node. It runs in the background, holds keys and rooms in locked memory, and talks to peers.
 - **`commx`** is the terminal client. It talks only to your local `commxd`.
 
-It runs on macOS, Linux, Windows and Android.
+It runs on macOS, Linux, Windows and Android. Friends without the app can join from a web browser.
 
 ## Install
 
@@ -46,6 +46,17 @@ Install `commx-android.apk` from a release (Android 8.0+, arm64 or x86_64). It's
   - Invites are copied as "sensitive", so clipboard previews hide them.
 - **Not on Android yet:** Tor mode, and sending or saving files. Receiving still works.
 - **Updates:** builds without a configured release key are signed with a throwaway key, and Android refuses to install an update signed with a different key. See [Develop](#develop) to set up a stable signing key.
+
+### Web browser (join only)
+
+The host runs `commxd --web web/` (release zips include `web/`; from source, run `web/build.sh` and pass `web/dist`). Every invite then also gets a browser link, `http://<host>:4700/#cx1:...`. Your friend opens it, picks an alias and is in the room.
+- **The host's node serves the page.** The browser connects back to that node over a WebSocket, on the same port as normal peers.
+- **Same protocol, same crypto.** The browser runs the commx protocol compiled to WebAssembly: the Noise handshake, the signed chain and the room keys, checked against the host fingerprint in the invite. The invite rides in the link's `#` part, which browsers never send to any server, and the page erases it from the address bar as soon as it's read.
+- **Members only.** A web page can't accept connections, so browser users can join rooms but can't host them.
+- **Nothing is stored.** The identity lives in RAM only.
+- **Leaving.** Closing the tab leaves the room, and the kill switch applies. Background tabs stay connected because the client answers the host's heartbeats instead of relying on timers.
+- **Text chat only for now.** File and call notices show up, but receiving files and voice need the desktop or Android app.
+- **Use a network you trust, or Tor.** Over plain `http://`, an attacker on the network between your friend and you could swap the page's code. Use it on a LAN or VPN you trust, such as Tailscale. Or run the host with `--tor`, and the friend opens the onion link in Tor Browser, where the onion address itself authenticates the server.
 
 ## Use
 

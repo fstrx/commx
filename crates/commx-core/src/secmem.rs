@@ -72,10 +72,16 @@ fn page_size() -> usize {
         unsafe { windows_sys::Win32::System::SystemInformation::GetSystemInfo(&mut info) };
         (info.dwPageSize as usize).max(4096)
     }
+    // WebAssembly: no paging or locking; keep allocations small.
+    #[cfg(not(any(unix, windows)))]
+    {
+        64
+    }
 }
 
 /// Pin pages in RAM and keep them out of core dumps. Best effort: failure
 /// (e.g. RLIMIT_MEMLOCK) leaves the data wiped-on-drop but swappable.
+#[cfg_attr(not(any(unix, windows)), allow(unused_variables))]
 fn lock_pages(ptr: *mut u8, len: usize) {
     #[cfg(unix)]
     unsafe {
@@ -89,6 +95,7 @@ fn lock_pages(ptr: *mut u8, len: usize) {
     }
 }
 
+#[cfg_attr(not(any(unix, windows)), allow(unused_variables))]
 fn unlock_pages(ptr: *mut u8, len: usize) {
     #[cfg(unix)]
     unsafe {

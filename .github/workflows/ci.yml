@@ -82,11 +82,19 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: cargo build --release --workspace
+      - name: Web client
+        shell: bash
+        run: |
+          rustup target add wasm32-unknown-unknown
+          V=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | grep version | cut -d'"' -f2)
+          cargo install wasm-bindgen-cli --version "$V" --locked
+          ./web/build.sh
       - shell: bash
         run: |
           mkdir -p out/commx-${{ matrix.name }}
           cp target/release/commxd${{ matrix.ext }} target/release/commx${{ matrix.ext }} out/commx-${{ matrix.name }}/
           cp README.md out/commx-${{ matrix.name }}/
+          cp -r web/dist out/commx-${{ matrix.name }}/web
           if [ "${{ matrix.ext }}" = ".exe" ]; then cp dist/install-windows.ps1 out/commx-${{ matrix.name }}/; else cp dist/*.plist dist/*.service out/commx-${{ matrix.name }}/; fi
           cd out && 7z a ../commx-${{ matrix.name }}.zip commx-${{ matrix.name }} >/dev/null 2>&1 || zip -r ../commx-${{ matrix.name }}.zip commx-${{ matrix.name }}
       - uses: softprops/action-gh-release@v2

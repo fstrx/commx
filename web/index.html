@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>commx</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<main id="app">
+  <section id="welcome" class="card">
+    <h1>commx</h1>
+    <p class="dim">End-to-end encrypted room, hosted by your friend's computer. Nothing is stored; closing this tab leaves the room.</p>
+    <p id="no-invite" class="warn" hidden>No invite in this link. Ask your friend for a fresh commx link.</p>
+    <form id="join-form">
+      <label for="alias">Pick an alias</label>
+      <input id="alias" autocomplete="off" maxlength="32" spellcheck="false" placeholder="no spaces">
+      <button id="join-btn" type="submit">Join room</button>
+    </form>
+    <p id="status" class="dim"></p>
+  </section>
+
+  <section id="room" hidden>
+    <header>
+      <div>
+        <h2 id="room-name"></h2>
+        <p id="room-meta" class="dim"></p>
+      </div>
+      <button id="leave-btn" class="danger" type="button">Leave</button>
+    </header>
+    <p id="members" class="dim"></p>
+    <ol id="lines"></ol>
+    <form id="send-form">
+      <input id="msg" autocomplete="off" maxlength="8000" spellcheck="false" placeholder="message">
+      <button type="submit">Send</button>
+    </form>
+  </section>
+
+  <section id="ended" class="card" hidden>
+    <h2>Room closed</h2>
+    <p id="ended-reason" class="warn"></p>
+    <p class="dim">Everything from this room was wiped from this page.</p>
+  </section>
+</main>
+</body>
+</html>

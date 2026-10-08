@@ -142,6 +142,13 @@ fn save_path(dest: &std::path::Path, name: &str) -> Result<std::path::PathBuf> {
     Ok(out)
 }
 
+/// `http://<room addr>/#<invite>`: the invite rides in the fragment, which
+/// browsers never send to any server.
+fn web_link(d: &crate::state::Daemon, id: &RoomId, code: &str) -> Option<String> {
+    let room = d.rooms.get(id)?;
+    d.web.then(|| format!("http://{}/#{code}", room.addr))
+}
+
 fn room_arg(s: &str) -> Result<RoomId> {
     parse_room_id(s).ok_or_else(|| anyhow!("bad room id"))
 }
@@ -223,14 +230,16 @@ async fn handle(
                 ok(tx, "onion address publishing; friends may need ~1 min before /join connects");
             }
             let code = d.make_invite(&id)?;
-            let _ = tx.send(IpcEvent::InviteCode { room_id: room_id_hex(&id), name, code });
+            let web_link = web_link(&d, &id, &code);
+            let _ = tx.send(IpcEvent::InviteCode { room_id: room_id_hex(&id), name, code, web_link });
         }
         IpcRequest::Invite { room_id } => {
             let id = room_arg(&room_id)?;
             let mut d = lock(shared);
             let code = d.make_invite(&id)?;
             let name = d.rooms[&id].cfg.name.clone();
-            let _ = tx.send(IpcEvent::InviteCode { room_id, name, code });
+            let web_link = web_link(&d, &id, &code);
+            let _ = tx.send(IpcEvent::InviteCode { room_id, name, code, web_link });
         }
         IpcRequest::Join { code } => {
             let id = net::join(shared.clone(), transport.clone(), &code).await?;

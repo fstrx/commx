@@ -571,6 +571,8 @@ pub struct Daemon {
     pub udp_index: HashMap<[u8; 8], (RoomId, PeerKind)>,
     /// Set in direct-TCP mode once the UDP socket is up.
     pub udp_out: Option<Outbox>,
+    /// Browser client enabled (`--web`): invites also get a web link.
+    pub web: bool,
     /// Test-only fault injection ("tick-task"); inert in release builds.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub fault: Option<String>,
@@ -589,6 +591,7 @@ impl Daemon {
             invites: HashMap::new(),
             udp_index: HashMap::new(),
             udp_out: None,
+            web: false,
             fault: None,
             events: Events::new(),
             power: Power::new(keep_awake),

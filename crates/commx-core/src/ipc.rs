@@ -101,7 +101,14 @@ pub enum IpcEvent {
         rooms: Vec<RoomSummary>,
     },
     Aliases { list: Vec<AliasInfo> },
-    InviteCode { room_id: String, name: String, code: String },
+    InviteCode {
+        room_id: String,
+        name: String,
+        code: String,
+        /// Browser join link, when the host serves the web client.
+        #[serde(default)]
+        web_link: Option<String>,
+    },
     Room { room: RoomSummary },
     Line { room_id: String, line: ChatLine },
     History { room_id: String, lines: Vec<ChatLine> },

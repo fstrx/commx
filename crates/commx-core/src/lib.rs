@@ -7,6 +7,7 @@ pub mod identity;
 pub mod invite;
 pub mod ipc;
 pub mod keystore;
+#[cfg(feature = "native")]
 pub mod local_ipc;
 pub mod room;
 pub mod secmem;
@@ -22,13 +23,22 @@ pub const MAX_TEXT_LEN: usize = 8 * 1024;
 
 /// Current unix time coarsened to the minute, to leak less timing metadata.
 pub fn now_minute() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() / 60)
-        .unwrap_or(0)
+    // Browsers: std's clock panics on wasm32-unknown-unknown; ask JS.
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        (js_sys::Date::now() / 60_000.0) as u64
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() / 60)
+            .unwrap_or(0)
+    }
 }
 
 /// Default home for alias files and the control socket.
+#[cfg(feature = "native")]
 pub fn default_data_dir() -> std::path::PathBuf {
     directories::ProjectDirs::from("", "", "commx")
         .map(|p| p.data_dir().to_path_buf())

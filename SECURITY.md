@@ -58,6 +58,18 @@ A daemon crash is a denial of service against every room on that node, since the
 - **Limit: no Tor yet on Android.** Peers see your IP, as in desktop direct mode.
 - **Limit: signing.** Builds without a release key are signed with a throwaway debug key. Only install APKs from the official release page.
 
+## Web client
+
+- **Who you trust is unchanged, mostly.** The page and its WebAssembly come from the room's host, which already sees the room as a member. There's no third-party server, and the browser still checks the host's identity key from the invite inside the Noise channel.
+- **Limit: page code over plain http.** An active network attacker between browser and host can modify the code before it runs. That defeats everything the code does, including encryption. Use the web client only on a trusted LAN/VPN, or via the room's onion in Tor Browser, where the onion address authenticates the server.
+- **Hardened HTTP surface.**
+  - Only a fixed list of files is served; no request path ever reaches the filesystem.
+  - Strict CSP: no inline script, no remote origins, `connect-src 'self'`.
+  - `no-referrer`, `nosniff`, `frame-ancestors 'none'`, `no-store`.
+  - WebSocket upgrades must be same-origin.
+- **Untrusted text is never parsed as HTML.** It's only assigned via `textContent`.
+- **Limit: browser memory can't be hardened.** JavaScript strings can't be wiped. On nuke, the page drops everything it displayed.
+
 ## Known limits
 
 - **Invites are bearer tokens.** They're single use and last 10 minutes, but anyone who intercepts one first can join. Check the fingerprints shown on join.

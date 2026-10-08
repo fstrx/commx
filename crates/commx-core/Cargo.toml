@@ -19,8 +19,13 @@ argon2.workspace = true
 zeroize.workspace = true
 data-encoding.workspace = true
 hex.workspace = true
-directories.workspace = true
-tokio = { version = "1", default-features = false, features = ["io-util", "net"] }
+directories = { workspace = true, optional = true }
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+
+[features]
+# OS integration (local control socket, data dir). Off for the WebAssembly client.
+default = ["native"]
+native = ["tokio/net", "dep:directories"]
 
 [dev-dependencies]
 tokio.workspace = true
@@ -30,3 +35,8 @@ libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
+
+# Browser: randomness from crypto.getRandomValues.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+js-sys = "0.3"

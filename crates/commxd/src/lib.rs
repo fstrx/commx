@@ -14,6 +14,7 @@ mod state;
 mod supervise;
 mod transport;
 mod udp;
+mod web;
 
 pub use commx_core::local_ipc::{Reader, Writer};
 pub use supervise::install_panic_hook;
@@ -47,6 +48,9 @@ pub struct Config {
     pub tor: bool,
     pub tor_bin: String,
     pub no_udp: bool,
+    /// Serve the browser client (files in this dir) and accept browser
+    /// members over WebSocket on the peer port.
+    pub web_dir: Option<PathBuf>,
 }
 
 /// How UI clients reach the daemon.
@@ -119,6 +123,8 @@ pub async fn run(cfg: Config, control: Control, shutdown: impl Future<Output = (
     };
 
     let shared: Shared = Arc::new(Mutex::new(Daemon::new(data_dir, transport.clone(), cfg.keep_awake)));
+    lock(&shared).web = cfg.web_dir.is_some();
+    let web_dir = Arc::new(cfg.web_dir.clone());
     // Voice fast path, direct mode only: Tor mode must never open UDP.
     if !cfg.tor && !cfg.no_udp {
         match tokio::net::UdpSocket::bind(bound).await {
@@ -136,6 +142,7 @@ pub async fn run(cfg: Config, control: Control, shutdown: impl Future<Output = (
         let preauth = Arc::new(Semaphore::new(MAX_PREAUTH));
         supervise::supervise("peer listener", move || {
             let (shared, transport, tcp, preauth) = (shared.clone(), transport.clone(), tcp.clone(), preauth.clone());
+            let web_dir = web_dir.clone();
             async move {
                 loop {
                     let stream = match transport.accept(&tcp).await {
@@ -147,7 +154,7 @@ pub async fn run(cfg: Config, control: Control, shutdown: impl Future<Output = (
                     };
                     // Shed load instead of queueing unauthenticated strangers.
                     let Ok(permit) = preauth.clone().try_acquire_owned() else { continue };
-                    tokio::spawn(net::handle_inbound(shared.clone(), transport.clone(), stream, permit));
+                    tokio::spawn(net::handle_inbound(shared.clone(), transport.clone(), stream, permit, web_dir.clone()));
                 }
             }
         });

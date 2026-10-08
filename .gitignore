@@ -6,3 +6,6 @@
 /android/app/build/
 /android/local.properties
 /android/.kotlin/
+
+# Built web client (web/build.sh)
+/web/dist/

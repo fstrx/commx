@@ -138,8 +138,18 @@ pub async fn handle_inbound(
     transport: Arc<Net>,
     stream: TcpStream,
     permit: OwnedSemaphorePermit,
+    web_dir: Arc<Option<std::path::PathBuf>>,
 ) {
-    let Ok(conn) = transport.respond(stream).await else { return };
+    // Browsers speak HTTP first: serve the client, or bridge a WebSocket into
+    // the same peer path below. Everyone else speaks Noise directly.
+    let conn = match web_dir.as_ref() {
+        Some(dir) if crate::web::looks_like_http(&stream).await => match crate::web::accept(stream, dir).await {
+            Ok(Some(ws)) => transport.respond_boxed(Box::new(ws)).await,
+            _ => return,
+        },
+        _ => transport.respond(stream).await,
+    };
+    let Ok(conn) = conn else { return };
     let mut reader = conn.reader;
     let Ok(Ok(WireMsg::JoinReq { room_id, token, member, sig })) =
         tokio::time::timeout(JOIN_TIMEOUT, reader.recv()).await

@@ -188,6 +188,12 @@ impl Net {
         Ok(stream)
     }
 
+    /// Responder side over any byte stream (e.g. a bridged WebSocket).
+    pub async fn respond_boxed(&self, stream: Box<dyn Stream>) -> Result<Conn> {
+        let limit = if self.is_tor() { TOR_HANDSHAKE_TIMEOUT } else { TCP_TIMEOUT };
+        tokio::time::timeout(limit, handshake(stream, &self.key, false)).await.context("handshake timed out")?
+    }
+
     pub async fn respond(&self, stream: TcpStream) -> Result<Conn> {
         let limit = if self.is_tor() { TOR_HANDSHAKE_TIMEOUT } else { TCP_TIMEOUT };
         tokio::time::timeout(limit, handshake(Box::new(stream), &self.key, false))

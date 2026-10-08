@@ -36,6 +36,10 @@ struct Args {
     /// tor executable to launch in --tor mode.
     #[arg(long, default_value = "tor")]
     tor_bin: String,
+    /// Serve the browser client from this directory, so friends can join
+    /// rooms from a web browser (members only).
+    #[arg(long)]
+    web: Option<PathBuf>,
     /// Don't use the UDP voice fast path (e.g. UDP is blocked); calls use TCP.
     #[arg(long)]
     no_udp: bool,
@@ -105,6 +109,7 @@ async fn main() -> Result<()> {
         tor: args.tor,
         tor_bin: args.tor_bin,
         no_udp: args.no_udp,
+        web_dir: args.web,
     };
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {

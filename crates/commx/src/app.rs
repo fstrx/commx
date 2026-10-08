@@ -301,11 +301,15 @@ impl App {
                     );
                 }
             }
-            IpcEvent::InviteCode { room_id, name, code } => {
+            IpcEvent::InviteCode { room_id, name, code, web_link } => {
                 self.log(format!("invite for #{name} (single use, 10 min):"), false);
                 self.log(code.clone(), false);
                 self.local_line(&room_id, "invite (single use, expires in 10 min) — send it over a channel you trust:".into());
                 self.local_line(&room_id, code);
+                if let Some(link) = web_link {
+                    self.log(format!("browser link (same invite, single use): {link}"), false);
+                    self.local_line(&room_id, format!("or open in a browser: {link}"));
+                }
                 self.notice = Some(Notice { text: format!("invite ready for #{name}"), error: false });
             }
             IpcEvent::Room { room } => {
