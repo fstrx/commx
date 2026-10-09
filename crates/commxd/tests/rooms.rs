@@ -640,3 +640,94 @@ fn malicious_file_name_cannot_escape_the_save_directory() {
     assert!(!home.join(".ssh/authorized_keys").exists(), "wrote outside Downloads");
     assert_eq!(std::fs::read(downloads.join("authorized_keys")).unwrap(), b"ssh-ed25519 AAAA attacker");
 }
+
+fn pw_invite(n: &mut Node, room: &str, password: &str) -> String {
+    n.req(json!({"op": "invite_password", "room_id": room, "password": password}));
+    let v = n.expect("password invite", 10, |v| v["ev"] == "invite_code");
+    assert_eq!(v["reusable"], true);
+    v["code"].as_str().unwrap().into()
+}
+
+/// Join request that must fail; returns the error text.
+fn join_err(n: &mut Node, code: &str, password: Option<&str>) -> String {
+    n.req(json!({"op": "join", "code": code, "password": password}));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match n.rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(v) if v["ev"] == "error" => return v["msg"].as_str().unwrap().to_string(),
+            Ok(v) if v["ev"] == "ok" && v["msg"].as_str().unwrap().starts_with("joined") => panic!("join should fail"),
+            Ok(_) => {}
+            Err(_) => panic!("timed out waiting for join error"),
+        }
+    }
+}
+
+#[test]
+fn password_invite_is_reusable_and_needs_the_password() {
+    let (mut a, mut b, mut c) = (Node::spawn("pw-a"), Node::spawn("pw-b"), Node::spawn("pw-c"));
+    a.alias("alice");
+    b.alias("bob");
+    c.alias("carol");
+    let (room, _) = a.room("club", "HostOnly", 15, false);
+    let code = pw_invite(&mut a, &room, "open sesame 42");
+    assert!(code.starts_with("cx2:"));
+
+    assert!(join_err(&mut b, &code, None).contains("needs a password"));
+    assert!(join_err(&mut b, &code, Some("open sesame 41")).contains("wrong password"));
+    a.expect_system("wrong password");
+    // Same code, twice more: it's reusable.
+    b.req(json!({"op": "join", "code": code, "password": "open sesame 42"}));
+    b.expect("bob joins", 10, |v| v["ev"] == "ok" && v["msg"].as_str().unwrap().starts_with("joined"));
+    c.req(json!({"op": "join", "code": code, "password": "open sesame 42"}));
+    c.expect("carol joins", 10, |v| v["ev"] == "ok" && v["msg"].as_str().unwrap().starts_with("joined"));
+    a.send(&room, "welcome both");
+    b.expect_msg("alice", "welcome both");
+    c.expect_msg("alice", "welcome both");
+
+    // Revoked: the same code is dead, even with the right password.
+    a.req(json!({"op": "invite_revoke", "room_id": room}));
+    a.expect("revoked", 5, |v| v["ev"] == "ok");
+    let mut d = Node::spawn("pw-d");
+    d.alias("dave");
+    assert!(join_err(&mut d, &code, Some("open sesame 42")).contains("invalid or revoked"));
+}
+
+#[test]
+fn password_invite_locks_after_repeated_wrong_passwords() {
+    let (mut a, mut b) = (Node::spawn("pwl-a"), Node::spawn("pwl-b"));
+    a.alias("alice");
+    b.alias("bob");
+    let (room, _) = a.room("club", "HostOnly", 15, false);
+    let code = pw_invite(&mut a, &room, "open sesame 42");
+    for i in 0..5 {
+        assert!(join_err(&mut b, &code, Some(&format!("guess number {i}"))).contains("wrong password"));
+    }
+    a.expect_system("password invite paused");
+    // Now even the right password is refused, before any proof is checked.
+    assert!(join_err(&mut b, &code, Some("open sesame 42")).contains("too many wrong passwords"));
+    // A fresh invite (new token) works again.
+    let code2 = pw_invite(&mut a, &room, "new password 99");
+    b.req(json!({"op": "join", "code": code2, "password": "new password 99"}));
+    b.expect("bob joins", 10, |v| v["ev"] == "ok" && v["msg"].as_str().unwrap().starts_with("joined"));
+}
+
+#[test]
+fn password_proof_is_never_sent_to_an_unproven_host() {
+    // An attacker who intercepts the connection can't pass the host proof,
+    // so the joiner must give up before sending anything password-derived.
+    // Simulate by pointing the invite at the right address but a different
+    // host key: the real host then looks like an impostor to the joiner.
+    let (mut a, mut b) = (Node::spawn("pwm-a"), Node::spawn("pwm-b"));
+    a.alias("alice");
+    b.alias("bob");
+    let (room, _) = a.room("club", "HostOnly", 15, false);
+    let code = pw_invite(&mut a, &room, "open sesame 42");
+    let mut inv = commx_core::invite::Invite::decode(&code).unwrap();
+    inv.host = commx_core::identity::Identity::generate("mallory").public();
+    let err = join_err(&mut b, &inv.encode(), Some("open sesame 42"));
+    assert!(err.contains("host failed identity proof"), "{err}");
+    // The host never saw a password attempt at all.
+    a.req(json!({"op": "history", "room_id": room}));
+    let h = a.expect("history", 5, |v| v["ev"] == "history");
+    assert!(!h.to_string().contains("wrong password"), "{h}");
+}

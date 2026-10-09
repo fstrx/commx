@@ -111,9 +111,9 @@ function pump() {
   for (const e of JSON.parse(member.events())) handle(e);
 }
 
-function connect(alias) {
+function connect(alias, password) {
   try {
-    member = new WebMember(invite, alias);
+    member = new WebMember(invite, alias, password);
   } catch (err) {
     setStatus(String(err.message || err), true);
     $('join-btn').disabled = false;
@@ -150,17 +150,25 @@ function connect(alias) {
 
 async function main() {
   await init();
-  if (!invite.startsWith('cx1:')) {
+  if (!invite.startsWith('cx1:') && !invite.startsWith('cx2:')) {
     $('no-invite').hidden = false;
     $('join-form').hidden = true;
     return;
   }
+  const needsPassword = WebMember.needs_password(invite);
+  $('password').hidden = $('password-label').hidden = !needsPassword;
   $('join-form').addEventListener('submit', (ev) => {
     ev.preventDefault();
     const alias = $('alias').value.trim();
-    if (!alias) return;
+    const password = $('password').value;
+    if (!alias || (needsPassword && !password)) return;
     $('join-btn').disabled = true;
-    connect(alias);
+    setStatus(needsPassword ? 'checking password…' : 'connecting…');
+    // Let the status paint before the (sub-second) password hashing.
+    setTimeout(() => {
+      connect(alias, needsPassword ? password : '');
+      $('password').value = '';
+    }, 20);
   });
   $('send-form').addEventListener('submit', (ev) => {
     ev.preventDefault();

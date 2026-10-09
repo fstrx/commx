@@ -197,7 +197,11 @@ object Commx {
                 val id = ev.getString("room_id")
                 val code = ev.getString("code")
                 _state.update { it.copy(invites = it.invites + (id to code)) }
-                localLine(id, "invite (single use, 10 min) — tap Invite to copy it")
+                localLine(
+                    id,
+                    if (ev.optBoolean("reusable")) "reusable password invite — tap Invite to copy it; send the password separately"
+                    else "invite (single use, 10 min) — tap Invite to copy it",
+                )
             }
             "room" -> {
                 val r = parseRoom(ev.getJSONObject("room"))

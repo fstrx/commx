@@ -15,7 +15,15 @@ pub enum IpcRequest {
     AliasList,
     RoomNew { name: String, kill_mode: KillMode, grace_secs: u64, dm: bool },
     Invite { room_id: String },
-    Join { code: String },
+    /// Create (or replace) the room's reusable, password-protected invite.
+    InvitePassword { room_id: String, password: String },
+    InviteRevoke { room_id: String },
+    Join {
+        code: String,
+        /// Needed for `cx2:` invites.
+        #[serde(default)]
+        password: Option<String>,
+    },
     Send { room_id: String, text: String },
     History { room_id: String },
     /// `None` nukes everything.
@@ -108,6 +116,9 @@ pub enum IpcEvent {
         /// Browser join link, when the host serves the web client.
         #[serde(default)]
         web_link: Option<String>,
+        /// Reusable password invite (`cx2:`) rather than single use.
+        #[serde(default)]
+        reusable: bool,
     },
     Room { room: RoomSummary },
     Line { room_id: String, line: ChatLine },

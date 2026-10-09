@@ -6,14 +6,14 @@ use commx_core::chain::{msg_aad, Block, Body, Chain, ChatPlain, FileMeta, Payloa
 use commx_core::crypto::{aead_decrypt, aead_encrypt, open_sealed, seal_to, RoomKey};
 use commx_core::secmem::{Locked, SealedLog};
 use commx_core::identity::{verify, Identity};
-use commx_core::invite::Invite;
+use commx_core::invite::{check_password_proof, Invite};
 use commx_core::ipc::{AliasInfo, ChatLine, FileInfo, IpcEvent, RoomSummary};
 use commx_core::room::{KillMode, MemberInfo, RoomConfig, MIN_GRACE_SECS};
 use commx_core::text::{clean, safe_file_name, valid_name};
 use commx_core::wire::{channel_binding, WireMsg};
 use commx_core::{room_id_hex, RoomId, MAX_TEXT_LEN};
 use rand::{rngs::OsRng, RngCore};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -221,6 +221,37 @@ pub struct PendingInvite {
     pub expires: Instant,
 }
 
+/// Wrong passwords tolerated per room within `PW_FAIL_WINDOW` before the
+/// password invite stops answering until older failures age out.
+pub const PW_MAX_FAILS: usize = 5;
+pub const PW_FAIL_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// A reusable `cx2:` invite (host only). Lives and dies with the room.
+pub struct PwInvite {
+    pub token: [u8; 16],
+    /// `invite::password_key`; wiped on drop.
+    pub key: Zeroizing<[u8; 32]>,
+    pub fails: VecDeque<Instant>,
+}
+
+impl PwInvite {
+    /// Too many recent wrong passwords?
+    pub fn locked(&mut self, now: Instant) -> bool {
+        while self.fails.front().is_some_and(|t| now.duration_since(*t) > PW_FAIL_WINDOW) {
+            self.fails.pop_front();
+        }
+        self.fails.len() >= PW_MAX_FAILS
+    }
+}
+
+/// How a joiner is authorised.
+pub enum JoinAuth {
+    /// Single-use `cx1:` token.
+    Token([u8; 16]),
+    /// `cx2:` token plus a channel-bound password proof.
+    Password { token: [u8; 16], proof: [u8; 32] },
+}
+
 pub struct Room {
     pub id: RoomId,
     pub cfg: RoomConfig,
@@ -245,6 +276,8 @@ pub struct Room {
     /// At most one call per room; dropping it wipes the call key.
     pub call: Option<Call>,
     pub over_tor: bool,
+    /// Reusable password invite, if the host made one.
+    pub pw_invite: Option<PwInvite>,
     /// Test-only fault injection point ("wire" / "tick"); inert in release builds.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub fault_armed: Option<&'static str>,
@@ -693,6 +726,7 @@ impl Daemon {
             call: None,
             data_dir: self.data_dir.clone(),
             over_tor: self.net.is_tor(),
+            pw_invite: None,
             fault_armed: None,
         };
         room.keys.insert(0, RoomKey::generate());
@@ -722,28 +756,109 @@ impl Daemon {
         }
         let mut token = [0u8; 16];
         OsRng.fill_bytes(&mut token);
-        let invite = Invite { addr: room.addr.clone(), host: room.host.id, room_id: *room_id, token };
+        let invite = Invite { addr: room.addr.clone(), host: room.host.id, room_id: *room_id, token, password: false };
         self.invites.insert(token, PendingInvite { room_id: *room_id, expires: Instant::now() + INVITE_TTL });
         Ok(invite.encode())
+    }
+
+    /// Check that a room can take a password invite (host only).
+    pub fn can_pw_invite(&self, room_id: &RoomId) -> Result<()> {
+        let room = self.rooms.get(room_id).ok_or_else(|| anyhow!("no such room"))?;
+        if !matches!(room.role, Role::Host { .. }) {
+            bail!("only the room host can invite");
+        }
+        if room.cfg.is_dm {
+            bail!("DMs only take single-use invites");
+        }
+        Ok(())
+    }
+
+    /// Install (or replace) the room's reusable invite; `key` is
+    /// `invite::password_key(password, room_id, token)`.
+    pub fn install_pw_invite(&mut self, room_id: &RoomId, token: [u8; 16], key: Zeroizing<[u8; 32]>) -> Result<String> {
+        self.can_pw_invite(room_id)?;
+        let ev = self.events.clone();
+        let room = self.rooms.get_mut(room_id).ok_or_else(|| anyhow!("no such room"))?;
+        let replaced = room.pw_invite.replace(PwInvite { token, key, fails: VecDeque::new() }).is_some();
+        room.system(
+            &ev,
+            if replaced { "password invite replaced; the old one no longer works" } else { "password invite created" },
+        );
+        let invite = Invite { addr: room.addr.clone(), host: room.host.id, room_id: *room_id, token, password: true };
+        Ok(invite.encode())
+    }
+
+    pub fn revoke_pw_invite(&mut self, room_id: &RoomId) -> Result<()> {
+        self.can_pw_invite(room_id)?;
+        let ev = self.events.clone();
+        let room = self.rooms.get_mut(room_id).ok_or_else(|| anyhow!("no such room"))?;
+        if room.pw_invite.take().is_none() {
+            bail!("this room has no password invite");
+        }
+        room.system(&ev, "password invite revoked");
+        Ok(())
+    }
+
+    /// Host side, step one of a password join: prove our alias on this
+    /// channel, but only to someone holding the current reusable invite.
+    pub fn pw_hello(&mut self, room_id: &RoomId, token: &[u8; 16], handshake_hash: &[u8]) -> std::result::Result<WireMsg, String> {
+        let room = self.rooms.get_mut(room_id).ok_or("invite invalid or revoked")?;
+        let Some(pw) = room.pw_invite.as_mut().filter(|p| &p.token == token) else {
+            return Err("invite invalid or revoked".into());
+        };
+        if pw.locked(Instant::now()) {
+            return Err("too many wrong passwords; try again later".into());
+        }
+        Ok(WireMsg::HostProof { host: room.host.clone(), sig: room.me.sign(&channel_binding(handshake_hash, "host")) })
     }
 
     /// Host side of a join. On success the JoinOk is already queued on `peer`.
     pub fn admit(
         &mut self,
         room_id: RoomId,
-        token: [u8; 16],
+        auth: JoinAuth,
         member: MemberInfo,
         sig: &[u8],
         handshake_hash: &[u8],
         peer: Peer,
     ) -> std::result::Result<(), String> {
         let deny = |s: &str| Err(s.to_string());
-        let invite_ok = self
-            .invites
-            .remove(&token)
-            .is_some_and(|i| i.room_id == room_id && i.expires > Instant::now());
-        if !invite_ok {
-            return deny("invite invalid, used or expired");
+        match auth {
+            JoinAuth::Token(token) => {
+                let invite_ok = self
+                    .invites
+                    .remove(&token)
+                    .is_some_and(|i| i.room_id == room_id && i.expires > Instant::now());
+                if !invite_ok {
+                    return deny("invite invalid, used or expired");
+                }
+            }
+            JoinAuth::Password { token, proof } => {
+                let ev = self.events.clone();
+                let Some(room) = self.rooms.get_mut(&room_id) else {
+                    return deny("invite invalid or revoked");
+                };
+                let Some(pw) = room.pw_invite.as_mut().filter(|p| p.token == token) else {
+                    return deny("invite invalid or revoked");
+                };
+                let now = Instant::now();
+                if pw.locked(now) {
+                    return deny("too many wrong passwords; try again later");
+                }
+                if !check_password_proof(&pw.key, handshake_hash, &proof) {
+                    pw.fails.push_back(now);
+                    let locked = pw.locked(now);
+                    room.system(
+                        &ev,
+                        if locked {
+                            format!("⚠ wrong invite password ({PW_MAX_FAILS} in 10 min): password invite paused")
+                        } else {
+                            "⚠ someone tried the password invite with a wrong password".into()
+                        },
+                    );
+                    return deny("wrong password");
+                }
+            }
         }
         if !verify(&member.id.sign_pk, &channel_binding(handshake_hash, "member"), sig) {
             return deny("bad identity proof");

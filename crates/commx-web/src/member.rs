@@ -7,7 +7,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use commx_core::chain::{msg_aad, Block, Body, Chain, ChatPlain, FileMeta, Payload};
 use commx_core::crypto::{open_sealed, RoomKey};
 use commx_core::identity::{verify, Identity};
-use commx_core::invite::Invite;
+use commx_core::invite::{password_key, password_proof, Invite};
 use commx_core::room::{KillMode, MemberInfo, RoomConfig};
 use commx_core::text::{clean, safe_file_name, valid_name};
 use commx_core::wire::{self, channel_binding, verify_nuke, WireMsg};
@@ -26,6 +26,8 @@ pub type Event = Value;
 enum Stage {
     /// Waiting for the responder's `e, ee, s, es`.
     Handshake(Box<snow::HandshakeState>),
+    /// Password invite: JoinHello sent, waiting for the host to prove itself.
+    HostCheck(Box<Transport>),
     /// Channel up, JoinReq sent, waiting for JoinOk.
     Joining(Box<Transport>),
     Room(Box<Transport>, Box<RoomState>),
@@ -78,6 +80,8 @@ fn frame(bytes: &[u8]) -> Vec<u8> {
 pub struct Member {
     me: Identity,
     invite: Invite,
+    /// `cx2:` invites: Argon2id of the password, used only after HostProof.
+    pw_key: Option<Zeroizing<[u8; 32]>>,
     stage: Stage,
     rx: Vec<u8>,
     out: Vec<u8>,
@@ -90,12 +94,17 @@ pub struct Member {
 impl Member {
     /// Parse the invite, make a fresh RAM-only alias, and queue the first
     /// handshake message. Nothing is ever stored.
-    pub fn new(invite_code: &str, alias: &str) -> Result<Self> {
+    pub fn new(invite_code: &str, alias: &str, password: Option<&str>) -> Result<Self> {
         let alias = alias.trim();
         if !valid_name(alias, 32) || alias.contains(char::is_whitespace) {
             bail!("alias must be 1-32 printable chars, no spaces");
         }
         let invite = Invite::decode(invite_code)?;
+        let pw_key = match (invite.password, password) {
+            (false, _) => None,
+            (true, None | Some("")) => bail!("this invite needs a password"),
+            (true, Some(pw)) => Some(password_key(pw, &invite.room_id, &invite.token)?),
+        };
         let params: snow::params::NoiseParams = NOISE_PARAMS.parse()?;
         let kp = snow::Builder::new(params.clone()).generate_keypair()?;
         let private = Zeroizing::new(kp.private);
@@ -105,6 +114,7 @@ impl Member {
         let mut m = Self {
             me: Identity::generate(alias),
             invite,
+            pw_key,
             stage: Stage::Handshake(Box::new(hs)),
             rx: Vec::new(),
             out: frame(&buf[..n]),
@@ -188,16 +198,30 @@ impl Member {
                 let hash = hs.get_handshake_hash().to_vec();
                 let noise = hs.into_stateless_transport_mode()?;
                 let mut t = Transport { noise, tx_nonce: 0, rx_nonce: 0, hash };
-                let req = WireMsg::JoinReq {
-                    room_id: self.invite.room_id,
-                    token: self.invite.token,
-                    member: MemberInfo { name: self.me.name.clone(), id: self.me.public() },
-                    sig: self.me.sign(&channel_binding(&t.hash, "member")),
-                };
-                self.out.extend(t.seal(&req)?);
-                self.event(json!({"ev": "status", "text": "joining…"}));
-                self.stage = Stage::Joining(Box::new(t));
+                if self.pw_key.is_some() {
+                    // Nothing derived from the password goes out until the
+                    // host proves itself on this channel.
+                    let hello = WireMsg::JoinHello { room_id: self.invite.room_id, token: self.invite.token };
+                    self.out.extend(t.seal(&hello)?);
+                    self.event(json!({"ev": "status", "text": "checking host…"}));
+                    self.stage = Stage::HostCheck(Box::new(t));
+                } else {
+                    self.send_join(t)?;
+                }
             }
+            Stage::HostCheck(mut t) => match t.open(f)? {
+                WireMsg::HostProof { host, sig } => {
+                    if host.id != self.invite.host || !verify(&host.id.sign_pk, &channel_binding(&t.hash, "host"), &sig) {
+                        bail!("host failed identity proof");
+                    }
+                    self.send_join(*t)?;
+                }
+                WireMsg::JoinDenied { reason } => {
+                    self.event(json!({"ev": "error", "msg": format!("join denied: {}", clean(&reason))}));
+                    self.alive = false;
+                }
+                _ => bail!("unexpected reply from host"),
+            },
             Stage::Joining(mut t) => match t.open(f)? {
                 WireMsg::JoinOk { cfg, host, host_sig, epoch, sealed_key, members, next_seq, head } => {
                     // The invite pins the host's keys; the signature pins them to this channel.
@@ -262,6 +286,22 @@ impl Member {
             }
             Stage::Dead => {}
         }
+        Ok(())
+    }
+
+    /// Send JoinReq (or, for password invites, JoinReqPw) and wait for JoinOk.
+    fn send_join(&mut self, mut t: Transport) -> Result<()> {
+        let room_id = self.invite.room_id;
+        let token = self.invite.token;
+        let member = MemberInfo { name: self.me.name.clone(), id: self.me.public() };
+        let sig = self.me.sign(&channel_binding(&t.hash, "member"));
+        let req = match &self.pw_key {
+            None => WireMsg::JoinReq { room_id, token, member, sig },
+            Some(k) => WireMsg::JoinReqPw { room_id, token, member, sig, proof: password_proof(k, &t.hash) },
+        };
+        self.out.extend(t.seal(&req)?);
+        self.event(json!({"ev": "status", "text": "joining…"}));
+        self.stage = Stage::Joining(Box::new(t));
         Ok(())
     }
 

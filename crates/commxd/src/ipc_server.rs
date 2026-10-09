@@ -1,6 +1,8 @@
 //! Local control socket for the TUI. Only the same unix user may connect.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
+use commx_core::invite::{password_key, MIN_PASSWORD_CHARS};
+use rand::{rngs::OsRng, RngCore};
 use commx_core::identity::Identity;
 use commx_core::ipc::{IpcEvent, IpcRequest};
 use commx_core::secmem::ZLines;
@@ -62,6 +64,8 @@ fn request_room(req: &IpcRequest) -> Option<RoomId> {
     use IpcRequest::*;
     let id = match req {
         Invite { room_id }
+        | InvitePassword { room_id, .. }
+        | InviteRevoke { room_id }
         | Send { room_id, .. }
         | History { room_id }
         | Nuke { room_id: Some(room_id) }
@@ -231,7 +235,7 @@ async fn handle(
             }
             let code = d.make_invite(&id)?;
             let web_link = web_link(&d, &id, &code);
-            let _ = tx.send(IpcEvent::InviteCode { room_id: room_id_hex(&id), name, code, web_link });
+            let _ = tx.send(IpcEvent::InviteCode { room_id: room_id_hex(&id), name, code, web_link, reusable: false });
         }
         IpcRequest::Invite { room_id } => {
             let id = room_arg(&room_id)?;
@@ -239,10 +243,32 @@ async fn handle(
             let code = d.make_invite(&id)?;
             let name = d.rooms[&id].cfg.name.clone();
             let web_link = web_link(&d, &id, &code);
-            let _ = tx.send(IpcEvent::InviteCode { room_id, name, code, web_link });
+            let _ = tx.send(IpcEvent::InviteCode { room_id, name, code, web_link, reusable: false });
         }
-        IpcRequest::Join { code } => {
-            let id = net::join(shared.clone(), transport.clone(), &code).await?;
+        IpcRequest::InvitePassword { room_id, password } => {
+            let id = room_arg(&room_id)?;
+            let password = Zeroizing::new(password);
+            if password.chars().count() < MIN_PASSWORD_CHARS {
+                bail!("invite password must be at least {MIN_PASSWORD_CHARS} characters");
+            }
+            lock(shared).can_pw_invite(&id)?;
+            let mut token = [0u8; 16];
+            OsRng.fill_bytes(&mut token);
+            let key = tokio::task::spawn_blocking(move || password_key(&password, &id, &token)).await??;
+            let mut d = lock(shared);
+            let code = d.install_pw_invite(&id, token, key)?;
+            let name = d.rooms[&id].cfg.name.clone();
+            let web_link = web_link(&d, &id, &code);
+            let _ = tx.send(IpcEvent::InviteCode { room_id, name, code, web_link, reusable: true });
+        }
+        IpcRequest::InviteRevoke { room_id } => {
+            let id = room_arg(&room_id)?;
+            lock(shared).revoke_pw_invite(&id)?;
+            ok(tx, "password invite revoked");
+        }
+        IpcRequest::Join { code, password } => {
+            let password = password.map(Zeroizing::new);
+            let id = net::join(shared.clone(), transport.clone(), &code, password.as_deref().map(|p| p.as_str())).await?;
             ok(tx, format!("joined {}", &room_id_hex(&id)[..8]));
         }
         IpcRequest::Send { room_id, text } => {

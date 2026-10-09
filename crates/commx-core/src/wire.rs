@@ -49,6 +49,21 @@ pub enum WireMsg {
     Nuke { room_id: RoomId, sig: Vec<u8> },
     /// Member → host: I'm leaving.
     Leave { room_id: RoomId },
+    // Password invites (`cx2:`). New variants go last: postcard numbers them.
+    /// Member → host, first message: prove you're the invite's host before I
+    /// show you anything derived from the password.
+    JoinHello { room_id: RoomId, token: [u8; 16] },
+    /// Host → member: alias signature over `channel_binding(hash, "host")`.
+    HostProof { host: MemberInfo, sig: Vec<u8> },
+    /// Member → host, after checking `HostProof`.
+    JoinReqPw {
+        room_id: RoomId,
+        token: [u8; 16],
+        member: MemberInfo,
+        sig: Vec<u8>,
+        /// `invite::password_proof` for this channel.
+        proof: [u8; 32],
+    },
 }
 
 pub fn channel_binding(handshake_hash: &[u8], role: &str) -> Vec<u8> {

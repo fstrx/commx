@@ -27,8 +27,14 @@ mod js {
     #[wasm_bindgen]
     impl WebMember {
         #[wasm_bindgen(constructor)]
-        pub fn new(invite: &str, alias: &str) -> Result<WebMember, JsError> {
-            Member::new(invite, alias).map(|inner| WebMember { inner }).map_err(|e| JsError::new(&format!("{e:#}")))
+        /// `password`: for `cx2:` invites; empty string for none.
+        pub fn new(invite: &str, alias: &str, password: &str) -> Result<WebMember, JsError> {
+            Member::new(invite, alias, (!password.is_empty()).then_some(password)).map(|inner| WebMember { inner }).map_err(|e| JsError::new(&format!("{e:#}")))
+        }
+
+        /// Does this invite (`cx2:`) need a password?
+        pub fn needs_password(invite: &str) -> bool {
+            commx_core::invite::Invite::decode(invite).is_ok_and(|i| i.password)
         }
 
         pub fn fingerprint(&self) -> String {

@@ -96,6 +96,8 @@ private sealed interface Dialog {
     data object NewRoom : Dialog
     data object Join : Dialog
     data class Invite(val code: String) : Dialog
+    data class InvitePassword(val roomId: String) : Dialog
+    data class JoinPassword(val code: String) : Dialog
     data class ConfirmNuke(val roomId: String?, val label: String) : Dialog
     data class Passphrase(val newAlias: String?) : Dialog
 }
@@ -127,7 +129,10 @@ fun CommxApp(
             is Cmd.RoomNew -> Commx.request("room_new", "name" to cmd.name, "kill_mode" to if (cmd.anyMember) "AnyMember" else "HostOnly", "grace_secs" to cmd.grace, "dm" to false)
             is Cmd.Dm -> Commx.request("room_new", "name" to cmd.label, "kill_mode" to "AnyMember", "grace_secs" to 15, "dm" to true)
             Cmd.Invite -> if (room == null) needRoom() else Commx.request("invite", "room_id" to room)
-            is Cmd.Join -> Commx.request("join", "code" to cmd.code)
+            Cmd.InvitePassword -> if (room == null) needRoom() else dialog = Dialog.InvitePassword(room)
+            Cmd.InviteRevoke -> if (room == null) needRoom() else Commx.request("invite_revoke", "room_id" to room)
+            is Cmd.Join -> if (cmd.code.startsWith("cx2:")) dialog = Dialog.JoinPassword(cmd.code)
+            else Commx.request("join", "code" to cmd.code, "password" to null)
             is Cmd.Nuke -> if (cmd.all) dialog = Dialog.ConfirmNuke(null, "everything")
             else if (room == null) needRoom() else dialog = Dialog.ConfirmNuke(room, "#${s.current?.name}")
             Cmd.Files -> if (room == null) needRoom() else Commx.request("files", "room_id" to room)
@@ -168,19 +173,50 @@ fun CommxApp(
                     dialog = null
                     run(Cmd.Join(code.trim()))
                 }
-                is Dialog.Invite -> AlertDialog(
-                    onDismissRequest = { dialog = null },
-                    title = { Text("Invite (single use, 10 min)") },
-                    text = {
-                        Column {
-                            Text("Send it over a channel you trust. It stops working once used.", color = Dim)
-                            Spacer(Modifier.height(8.dp))
-                            Text(d.code, fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = Accent)
-                        }
-                    },
-                    confirmButton = { Button(onClick = { copySecret("commx invite", d.code); Commx.notify("invite copied", false); dialog = null }) { Text("Copy") } },
-                    dismissButton = { TextButton(onClick = { dialog = null }) { Text("Close") } },
-                )
+                is Dialog.Invite -> {
+                    val reusable = d.code.startsWith("cx2:")
+                    val roomId = s.selected
+                    AlertDialog(
+                        onDismissRequest = { dialog = null },
+                        title = { Text(if (reusable) "Reusable invite (password)" else "Invite (single use, 10 min)") },
+                        text = {
+                            Column {
+                                Text(
+                                    if (reusable) "Works until the room ends or you revoke it, only with the password. Send the password over a different channel."
+                                    else "Send it over a channel you trust. It stops working once used.",
+                                    color = Dim,
+                                )
+                                Spacer(Modifier.height(8.dp))
+                                Text(d.code, fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = Accent)
+                                if (roomId != null) Row {
+                                    if (!reusable) TextButton(onClick = { dialog = Dialog.InvitePassword(roomId) }) { Text("Make reusable…") }
+                                    else TextButton(onClick = { Commx.request("invite_revoke", "room_id" to roomId); dialog = null }) { Text("Revoke", color = Danger) }
+                                    TextButton(onClick = { Commx.request("invite", "room_id" to roomId); dialog = null }) { Text("New single-use") }
+                                }
+                            }
+                        },
+                        confirmButton = { Button(onClick = { copySecret("commx invite", d.code); Commx.notify("invite copied", false); dialog = null }) { Text("Copy") } },
+                        dismissButton = { TextButton(onClick = { dialog = null }) { Text("Close") } },
+                    )
+                }
+                is Dialog.InvitePassword -> SecretDialog(
+                    title = "Reusable invite",
+                    hint = "Anyone with the invite and this password can join until the room ends. 8+ characters.",
+                    minLen = 8,
+                    onDismiss = { dialog = null },
+                ) { pw ->
+                    dialog = null
+                    Commx.request("invite_password", "room_id" to d.roomId, "password" to pw)
+                }
+                is Dialog.JoinPassword -> SecretDialog(
+                    title = "Invite password",
+                    hint = "This invite is protected by a password. Ask whoever sent it.",
+                    minLen = 1,
+                    onDismiss = { dialog = null },
+                ) { pw ->
+                    dialog = null
+                    Commx.request("join", "code" to d.code, "password" to pw)
+                }
                 is Dialog.ConfirmNuke -> AlertDialog(
                     onDismissRequest = { dialog = null },
                     title = { Text("Nuke ${d.label}?") },
@@ -476,11 +512,11 @@ private fun JoinDialog(pasteText: () -> String?, onDismiss: () -> Unit, join: (S
         title = { Text("Join a room") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(code, { code = it }, label = { Text("invite (cx1:...)") }, maxLines = 4)
+                OutlinedTextField(code, { code = it }, label = { Text("invite (cx1:... or cx2:...)") }, maxLines = 4)
                 TextButton(onClick = { pasteText()?.let { code = it.trim() } }) { Text("Paste") }
             }
         },
-        confirmButton = { Button(enabled = code.trim().startsWith("cx1:"), onClick = { join(code) }) { Text("Join") } },
+        confirmButton = { Button(enabled = code.trim().let { it.startsWith("cx1:") || it.startsWith("cx2:") }, onClick = { join(code) }) { Text("Join") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
@@ -497,6 +533,25 @@ private fun PassphraseDialog(newAlias: String?, onDismiss: () -> Unit, done: (St
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
         },
         confirmButton = { Button(enabled = pass.length >= (if (newAlias != null) 8 else 1), onClick = { done(pass) }) { Text("OK") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun SecretDialog(title: String, hint: String, minLen: Int, onDismiss: () -> Unit, done: (String) -> Unit) {
+    var pass by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(hint, color = Dim)
+                OutlinedTextField(pass, { pass = it }, label = { Text("password") }, singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password))
+            }
+        },
+        confirmButton = { Button(enabled = pass.length >= minLen, onClick = { done(pass) }) { Text("OK") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }

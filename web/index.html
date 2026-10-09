@@ -17,6 +17,8 @@
     <form id="join-form">
       <label for="alias">Pick an alias</label>
       <input id="alias" autocomplete="off" maxlength="32" spellcheck="false" placeholder="no spaces">
+      <label for="password" id="password-label" hidden>Invite password</label>
+      <input id="password" type="password" autocomplete="off" maxlength="256" hidden>
       <button id="join-btn" type="submit">Join room</button>
     </form>
     <p id="status" class="dim"></p>

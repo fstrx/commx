@@ -53,6 +53,10 @@ pub const LOCAL: &str = "~";
 pub enum Secret {
     Unlock,
     NewAlias(String),
+    /// New reusable invite for this room.
+    InvitePassword(String),
+    /// Joining a `cx2:` invite.
+    JoinPassword(String),
 }
 
 #[derive(Default)]
@@ -301,13 +305,18 @@ impl App {
                     );
                 }
             }
-            IpcEvent::InviteCode { room_id, name, code, web_link } => {
-                self.log(format!("invite for #{name} (single use, 10 min):"), false);
+            IpcEvent::InviteCode { room_id, name, code, web_link, reusable } => {
+                let kind = if reusable {
+                    "reusable until the room ends or /invite revoke; needs the password — send the password separately"
+                } else {
+                    "single use, expires in 10 min"
+                };
+                self.log(format!("invite for #{name} ({kind}):"), false);
                 self.log(code.clone(), false);
-                self.local_line(&room_id, "invite (single use, expires in 10 min) — send it over a channel you trust:".into());
+                self.local_line(&room_id, format!("invite ({kind}) — send it over a channel you trust:"));
                 self.local_line(&room_id, code);
                 if let Some(link) = web_link {
-                    self.log(format!("browser link (same invite, single use): {link}"), false);
+                    self.log(format!("browser link (same invite): {link}"), false);
                     self.local_line(&room_id, format!("or open in a browser: {link}"));
                 }
                 self.notice = Some(Notice { text: format!("invite ready for #{name}"), error: false });
@@ -380,6 +389,11 @@ impl App {
                 Secret::NewAlias(name) => {
                     vec![IpcRequest::AliasNew { name, ephemeral: false, passphrase: Some(input) }]
                 }
+                Secret::InvitePassword(room_id) => vec![IpcRequest::InvitePassword { room_id, password: input }],
+                Secret::JoinPassword(code) => {
+                    self.notice = Some(Notice { text: "connecting…".into(), error: false });
+                    vec![IpcRequest::Join { code, password: Some(input) }]
+                }
             };
         }
         if input.trim().is_empty() {
@@ -436,12 +450,27 @@ impl App {
                 grace_secs: commx_core::room::DEFAULT_GRACE_SECS,
                 dm: true,
             }],
+            Command::Join(code) if code.trim().starts_with("cx2:") => {
+                self.secret = Some(Secret::JoinPassword(code));
+                Vec::new()
+            }
             Command::Join(code) => {
                 self.notice = Some(Notice { text: "connecting…".into(), error: false });
-                vec![IpcRequest::Join { code }]
+                vec![IpcRequest::Join { code, password: None }]
             }
             Command::Invite => match room {
                 Some(room_id) => vec![IpcRequest::Invite { room_id }],
+                None => need_room(self),
+            },
+            Command::InvitePassword => match room {
+                Some(room_id) => {
+                    self.secret = Some(Secret::InvitePassword(room_id));
+                    Vec::new()
+                }
+                None => need_room(self),
+            },
+            Command::InviteRevoke => match room {
+                Some(room_id) => vec![IpcRequest::InviteRevoke { room_id }],
                 None => need_room(self),
             },
             Command::SendFile(path) => match room {

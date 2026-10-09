@@ -10,6 +10,8 @@ sealed interface Cmd {
     data class RoomNew(val name: String, val anyMember: Boolean, val grace: Long) : Cmd
     data class Dm(val label: String) : Cmd
     data object Invite : Cmd
+    data object InvitePassword : Cmd
+    data object InviteRevoke : Cmd
     data class Join(val code: String) : Cmd
     data class Nuke(val all: Boolean) : Cmd
     data object Files : Cmd
@@ -24,7 +26,7 @@ sealed interface Cmd {
 val HELP = listOf(
     "/alias new <name> [--ephemeral]   ·   /alias use <name>   ·   /aliases   ·   /unlock",
     "/room new <name> [--any-member] [--grace N]   ·   /dm <label>",
-    "/invite   ·   /join <cx1:...>   ·   /files",
+    "/invite   ·   /invite pw (reusable, password)   ·   /invite revoke   ·   /join <cx1:...|cx2:...>   ·   /files",
     "/call   ·   /hangup   ·   /mute   ·   /ptt (hold the talk button)",
     "/nuke (this room)   ·   /nuke all   ·   /status",
 )
@@ -66,8 +68,13 @@ fun parseCmd(input: String): Result<Cmd> {
             else Result.success(Cmd.RoomNew(name.joinToString(" "), any, grace))
         }
         "/dm" -> if (rest.isEmpty()) usage("/dm <label>") else Result.success(Cmd.Dm(rest.joinToString(" ")))
-        "/invite" -> Result.success(Cmd.Invite)
-        "/join" -> if (rest.size == 1) Result.success(Cmd.Join(rest[0])) else usage("/join <cx1:...>")
+        "/invite" -> when (rest) {
+            emptyList<String>() -> Result.success(Cmd.Invite)
+            listOf("pw"), listOf("password") -> Result.success(Cmd.InvitePassword)
+            listOf("revoke") -> Result.success(Cmd.InviteRevoke)
+            else -> usage("/invite [pw|revoke]")
+        }
+        "/join" -> if (rest.size == 1) Result.success(Cmd.Join(rest[0])) else usage("/join <cx1:...|cx2:...>")
         "/nuke" -> when (rest) {
             emptyList<String>() -> Result.success(Cmd.Nuke(false))
             listOf("all") -> Result.success(Cmd.Nuke(true))

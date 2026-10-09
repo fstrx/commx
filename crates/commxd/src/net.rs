@@ -11,7 +11,7 @@ use crate::files::FileState;
 use crate::state::human_size;
 use commx_core::crypto::{open_sealed, RoomKey};
 use commx_core::identity::verify;
-use commx_core::invite::Invite;
+use commx_core::invite::{password_key, password_proof, Invite};
 use commx_core::ipc::IpcEvent;
 use commx_core::room::MemberInfo;
 use commx_core::wire::{channel_binding, WireMsg};
@@ -27,7 +27,7 @@ use crate::files::hash_file;
 use crate::supervise::contain;
 use crate::udp::UdpPath;
 use crate::state::{
-    lock, Followup, Lanes, Peer, PeerKind, Role, Room, Shared, BULK_QUEUE, MAX_LINES, MEDIA_QUEUE, PEER_QUEUE,
+    lock, Followup, JoinAuth, Lanes, Peer, PeerKind, Role, Room, Shared, BULK_QUEUE, MAX_LINES, MEDIA_QUEUE, PEER_QUEUE,
 };
 use commx_core::secmem::SealedLog;
 use crate::transport::{Net, SecureReader, SecureWriter};
@@ -151,10 +151,25 @@ pub async fn handle_inbound(
     };
     let Ok(conn) = conn else { return };
     let mut reader = conn.reader;
-    let Ok(Ok(WireMsg::JoinReq { room_id, token, member, sig })) =
-        tokio::time::timeout(JOIN_TIMEOUT, reader.recv()).await
-    else {
-        return;
+    let mut writer = conn.writer;
+    let (room_id, auth, member, sig) = match tokio::time::timeout(JOIN_TIMEOUT, reader.recv()).await {
+        Ok(Ok(WireMsg::JoinReq { room_id, token, member, sig })) => (room_id, JoinAuth::Token(token), member, sig),
+        // Password invite: prove who we are first, then take the proof.
+        Ok(Ok(WireMsg::JoinHello { room_id, token })) => {
+            let hello = contain(|| lock(&shared).pw_hello(&room_id, &token, &conn.handshake_hash))
+                .unwrap_or_else(|()| Err("internal error".into()));
+            let reply = hello.clone().unwrap_or_else(|reason| WireMsg::JoinDenied { reason });
+            if writer.send(&reply).await.is_err() || hello.is_err() {
+                return;
+            }
+            match tokio::time::timeout(JOIN_TIMEOUT, reader.recv()).await {
+                Ok(Ok(WireMsg::JoinReqPw { room_id: r, token: t, member, sig, proof })) if r == room_id && t == token => {
+                    (room_id, JoinAuth::Password { token, proof }, member, sig)
+                }
+                _ => return,
+            }
+        }
+        _ => return,
     };
     let (lanes, rxs) = lanes();
     let tx = lanes.ctl.clone();
@@ -165,7 +180,7 @@ pub async fn handle_inbound(
         let udp = d.udp_out.clone().map(|out| UdpPath::new(&conn.handshake_hash, None, out));
         let udp_id = udp.as_ref().map(|u| u.id);
         let peer = Peer::new(lanes, cancel_tx, udp);
-        let res = match contain(|| d.admit(room_id, token, member, &sig, &conn.handshake_hash, peer)) {
+        let res = match contain(|| d.admit(room_id, auth, member, &sig, &conn.handshake_hash, peer)) {
             Ok(r) => r,
             Err(()) => {
                 d.contained_fault(&room_id);
@@ -182,15 +197,24 @@ pub async fn handle_inbound(
     }
     drop(tx);
     drop(permit);
-    tokio::spawn(writer_task(rxs, conn.writer));
+    tokio::spawn(writer_task(rxs, writer));
     if res.is_ok() {
         reader_loop(shared, reader, cancel_rx, room_id, PeerKind::Member(sign_pk)).await;
     }
 }
 
 /// Member side: dial a host from an invite code and join its room.
-pub async fn join(shared: Shared, transport: Arc<Net>, code: &str) -> Result<RoomId> {
+pub async fn join(shared: Shared, transport: Arc<Net>, code: &str, password: Option<&str>) -> Result<RoomId> {
     let invite = Invite::decode(code)?;
+    // Derive before dialing, so the host isn't kept waiting on Argon2.
+    let pw_key = match (invite.password, password) {
+        (false, _) => None,
+        (true, None) => bail!("that invite needs a password"),
+        (true, Some(pw)) => {
+            let (pw, room_id, token) = (Zeroizing::new(pw.to_string()), invite.room_id, invite.token);
+            Some(tokio::task::spawn_blocking(move || password_key(&pw, &room_id, &token)).await??)
+        }
+    };
     let me = {
         let d = lock(&shared);
         if d.rooms.contains_key(&invite.room_id) {
@@ -205,21 +229,37 @@ pub async fn join(shared: Shared, transport: Arc<Net>, code: &str) -> Result<Roo
     let conn = transport.dial(&invite.addr).await?;
     let (mut reader, mut writer) = (conn.reader, conn.writer);
     let member = MemberInfo { name: me.name.clone(), id: me.public() };
-    writer
-        .send(&WireMsg::JoinReq {
-            room_id: invite.room_id,
-            token: invite.token,
-            member,
-            sig: me.sign(&channel_binding(&conn.handshake_hash, "member")),
-        })
-        .await?;
+    let sig = me.sign(&channel_binding(&conn.handshake_hash, "member"));
+    match &pw_key {
+        None => writer.send(&WireMsg::JoinReq { room_id: invite.room_id, token: invite.token, member, sig }).await?,
+        Some(key) => {
+            // Nothing derived from the password leaves until the far end has
+            // proven, on this very channel, that it is the invite's host.
+            writer.send(&WireMsg::JoinHello { room_id: invite.room_id, token: invite.token }).await?;
+            match tokio::time::timeout(JOIN_TIMEOUT, reader.recv()).await.context("host didn't answer")?? {
+                WireMsg::HostProof { host, sig: host_sig } => {
+                    if host.id != invite.host
+                        || !verify(&host.id.sign_pk, &channel_binding(&conn.handshake_hash, "host"), &host_sig)
+                    {
+                        bail!("host failed identity proof");
+                    }
+                }
+                WireMsg::JoinDenied { reason } => bail!("join denied: {}", clean(&reason)),
+                _ => bail!("unexpected reply from host"),
+            }
+            let proof = password_proof(key, &conn.handshake_hash);
+            writer
+                .send(&WireMsg::JoinReqPw { room_id: invite.room_id, token: invite.token, member, sig, proof })
+                .await?;
+        }
+    }
 
     let reply = tokio::time::timeout(JOIN_TIMEOUT, reader.recv()).await.context("host didn't answer")??;
     let (cfg, host, host_sig, epoch, sealed_key, members, next_seq, head) = match reply {
         WireMsg::JoinOk { cfg, host, host_sig, epoch, sealed_key, members, next_seq, head } => {
             (cfg, host, host_sig, epoch, sealed_key, members, next_seq, head)
         }
-        WireMsg::JoinDenied { reason } => bail!("join denied: {reason}"),
+        WireMsg::JoinDenied { reason } => bail!("join denied: {}", clean(&reason)),
         _ => bail!("unexpected reply from host"),
     };
     // The invite pins the host's keys; the signature pins them to this channel.
@@ -280,6 +320,7 @@ pub async fn join(shared: Shared, transport: Arc<Net>, code: &str) -> Result<Roo
             call: None,
             data_dir: d.data_dir.clone(),
             over_tor: d.net.is_tor(),
+            pw_invite: None,
             fault_armed: None,
         };
         room.system(

@@ -119,7 +119,7 @@ async fn host_with_room(tag: &str, grace: u64) -> (Host, String, String) {
 async fn web_member_joins_and_chats_both_ways() {
     let (mut host, code, room) = host_with_room("chat", 15).await;
     let addr = commx_core::invite::Invite::decode(&code).unwrap().addr;
-    let mut m = Member::new(&code, "webby").unwrap();
+    let mut m = Member::new(&code, "webby", None).unwrap();
     let mut sock = TcpStream::connect(&addr).await.unwrap();
 
     let joined = pump(&mut m, &mut sock, "joined", |e| e["ev"] == "joined").await;
@@ -140,7 +140,7 @@ async fn web_member_joins_and_chats_both_ways() {
 async fn web_member_stays_alive_by_answering_heartbeats() {
     let (host, code, room) = host_with_room("hb", 3).await;
     let addr = commx_core::invite::Invite::decode(&code).unwrap().addr;
-    let mut m = Member::new(&code, "webby").unwrap();
+    let mut m = Member::new(&code, "webby", None).unwrap();
     let mut sock = TcpStream::connect(&addr).await.unwrap();
     pump(&mut m, &mut sock, "joined", |e| e["ev"] == "joined").await;
 
@@ -155,7 +155,7 @@ async fn web_member_stays_alive_by_answering_heartbeats() {
 async fn web_member_honours_host_nuke() {
     let (host, code, room) = host_with_room("nuke", 15).await;
     let addr = commx_core::invite::Invite::decode(&code).unwrap().addr;
-    let mut m = Member::new(&code, "webby").unwrap();
+    let mut m = Member::new(&code, "webby", None).unwrap();
     let mut sock = TcpStream::connect(&addr).await.unwrap();
     pump(&mut m, &mut sock, "joined", |e| e["ev"] == "joined").await;
     host.req(json!({"op": "nuke", "room_id": room}));
@@ -173,15 +173,52 @@ fn garbage_from_the_network_ends_the_room_without_panicking() {
             host: commx_core::identity::Identity::generate("h").public(),
             room_id: [1; 16],
             token: [2; 16],
+            password: false,
         };
         inv.encode()
     };
     for junk in [vec![0u8; 3], vec![0xff; 8], vec![0, 0, 0, 5, 1, 2, 3, 4, 5], vec![0, 0, 0, 0]] {
-        let mut m = Member::new(&code, "webby").unwrap();
+        let mut m = Member::new(&code, "webby", None).unwrap();
         m.on_bytes(&junk);
         m.on_bytes(&[0, 0, 0, 2, 9, 9]);
         let _ = m.take_events();
     }
-    assert!(Member::new("not an invite", "webby").is_err());
-    assert!(Member::new(&code, "two words").is_err());
+    assert!(Member::new("not an invite", "webby", None).is_err());
+    assert!(Member::new(&code, "two words", None).is_err());
+}
+
+async fn pw_room(host: &mut Host, room: &str, pw: &str) -> String {
+    host.req(json!({"op": "invite_password", "room_id": room, "password": pw}));
+    host.expect("pw invite", |v| v["ev"] == "invite_code" && v["reusable"] == true).await["code"].as_str().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_member_joins_with_password_invite() {
+    let (mut host, _, room) = host_with_room("pw", 15).await;
+    let code = pw_room(&mut host, &room, "open sesame 42").await;
+    let addr = commx_core::invite::Invite::decode(&code).unwrap().addr;
+    assert!(Member::new(&code, "webby", None).is_err(), "cx2 needs a password");
+
+    let mut bad = Member::new(&code, "webby", Some("open sesame 41")).unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
+    let e = pump(&mut bad, &mut sock, "denied", |e| e["ev"] == "error").await;
+    assert!(e["msg"].as_str().unwrap().contains("wrong password"), "{e}");
+
+    for name in ["webby", "webster"] {
+        let mut m = Member::new(&code, name, Some("open sesame 42")).unwrap();
+        let mut sock = TcpStream::connect(&addr).await.unwrap();
+        pump(&mut m, &mut sock, "joined", |e| e["ev"] == "joined").await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_member_never_sends_password_proof_to_unproven_host() {
+    let (mut host, _, room) = host_with_room("pwm", 15).await;
+    let code = pw_room(&mut host, &room, "open sesame 42").await;
+    let mut inv = commx_core::invite::Invite::decode(&code).unwrap();
+    inv.host = commx_core::identity::Identity::generate("mallory").public();
+    let mut m = Member::new(&inv.encode(), "webby", Some("open sesame 42")).unwrap();
+    let mut sock = TcpStream::connect(&inv.addr).await.unwrap();
+    let e = pump(&mut m, &mut sock, "nuked", |e| e["ev"] == "nuked").await;
+    assert!(e["reason"].as_str().unwrap().contains("host failed identity proof"), "{e}");
 }

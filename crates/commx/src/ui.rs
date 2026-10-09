@@ -187,6 +187,11 @@ fn input_box(f: &mut Frame, app: &App, area: Rect) {
             format!(" passphrase for '{n}' (8+ chars, hidden) "),
             "•".repeat(app.input.chars().count()),
         ),
+        Some(Secret::InvitePassword(_)) => (
+            " password for the reusable invite (8+ chars, hidden) ".to_string(),
+            "•".repeat(app.input.chars().count()),
+        ),
+        Some(Secret::JoinPassword(_)) => (" invite password (hidden) ".to_string(), "•".repeat(app.input.chars().count())),
         None => {
             let t = match app.current() {
                 Some(r) => format!(" message {}{} ", if r.is_dm { "@" } else { "#" }, r.name),
