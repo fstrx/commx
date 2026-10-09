@@ -61,18 +61,25 @@ A daemon crash is a denial of service against every room on that node, since the
 ## Web client
 
 - **Who you trust is unchanged, mostly.** The page and its WebAssembly come from the room's host, which already sees the room as a member. There's no third-party server, and the browser still checks the host's identity key from the invite inside the Noise channel.
-- **Limit: page code over plain http.** An active network attacker between browser and host can modify the code before it runs. That defeats everything the code does, including encryption. Use the web client only on a trusted LAN/VPN, or via the room's onion in Tor Browser, where the onion address authenticates the server.
+- **Limit: page code over plain http.** An active network attacker between browser and host can modify the code before it runs. That defeats everything the code does, including encryption. Use `--web-tls`, a trusted LAN/VPN, or the room's onion in Tor Browser, where the onion address authenticates the server.
+- **`--web-tls` is only as good as the fingerprint check.** The certificate is self-signed, made fresh in RAM each run, and never written to disk. Browsers can't tell it from an attacker's self-signed certificate, so the friend has to compare the SHA-256 shown with the host's invite against the browser's certificate details before clicking through the warning. Plain http on a `--web-tls` port only redirects to https and never serves the client.
 - **Hardened HTTP surface.**
   - Only a fixed list of files is served; no request path ever reaches the filesystem.
-  - Strict CSP: no inline script, no remote origins, `connect-src 'self'`.
+  - Strict CSP: no inline script, no remote origins, `connect-src` limited to the page's own origin (named explicitly for Safari).
   - `no-referrer`, `nosniff`, `frame-ancestors 'none'`, `no-store`.
   - WebSocket upgrades must be same-origin.
 - **Untrusted text is never parsed as HTML.** It's only assigned via `textContent`.
-- **Limit: browser memory can't be hardened.** JavaScript strings can't be wiped. On nuke, the page drops everything it displayed.
+- **Limit: browser memory can't be hardened.** JavaScript strings can't be wiped. On nuke, the page drops everything it displayed. Received files sit decrypted in WebAssembly memory, which is wiped when the room ends. A file you save becomes an ordinary download, and a decoded call's audio passes through the browser's audio stack.
+- **Microphone.** Allowed only for the page's own origin (`Permissions-Policy: microphone=(self)`) and only while you're in a call. Muting sends silent frames, not nothing, so the host and network can't see when you talk.
 
 ## Known limits
 
-- **Invites are bearer tokens.** They're single use and last 10 minutes, but anyone who intercepts one first can join. Check the fingerprints shown on join.
+- **Invites are bearer tokens.** `cx1:` invites are single use and last 10 minutes, but anyone who intercepts one first can join. Check the fingerprints shown on join.
+- **Password invites (`cx2:`).** These are reusable until the room ends or is revoked, and need the code plus the password.
+  - **Offline guessing:** the password-derived proof is bound to the Noise channel. It's only sent after the host proves its alias on that channel, so an interceptor learns nothing to guess against offline. The host itself holds the Argon2id key, as it would hold any password it sets.
+  - **Online guessing:** limited to 5 wrong passwords per 10 minutes per invite, after which it pauses. A weak password can still fall to patient online guessing, so use a real passphrase. The flip side: someone who has the code but not the password can keep the invite paused. If that happens, make a new one (`/invite pw`).
+  - **Who joined:** anyone with both can join any number of times, as a fresh alias each time. Watch the join lines and fingerprints, and revoke when done.
+- **Late joiners miss running calls.** A member who joins while a call is already running doesn't get the call key, and can't join until a new call starts.
 - **No reconnect.** A real disconnect is a drop, by design.
 - **Voice frames aren't signed per sender.** They're authenticated as "someone holding the call key". A malicious participant, or the host, could inject audio attributed to someone else. Chat messages and files *are* signed. Per-frame signatures would roughly double call bandwidth.
 - **UDP fast path (direct mode only).**

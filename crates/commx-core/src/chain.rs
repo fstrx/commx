@@ -58,6 +58,22 @@ impl FileMeta {
     }
 }
 
+/// AAD for a file announcement's sealed `FileMeta`.
+pub fn file_meta_aad(room_id: &RoomId, epoch: u32, author: &[u8; 32], file_id: &[u8; 16]) -> Vec<u8> {
+    let mut aad = msg_aad(room_id, epoch, author);
+    aad.extend_from_slice(b"file");
+    aad.extend_from_slice(file_id);
+    aad
+}
+
+/// AAD for a call announcement's sealed `voice::CallMeta`.
+pub fn call_meta_aad(room_id: &RoomId, epoch: u32, author: &[u8; 32], call_id: &[u8; 16]) -> Vec<u8> {
+    let mut aad = msg_aad(room_id, epoch, author);
+    aad.extend_from_slice(b"call");
+    aad.extend_from_slice(call_id);
+    aad
+}
+
 /// AAD for a file chunk: binds it to its file and position.
 pub fn chunk_aad(file_id: &[u8; 16], idx: u32) -> Vec<u8> {
     let mut aad = b"commx-chunk".to_vec();

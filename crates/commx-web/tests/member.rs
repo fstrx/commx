@@ -33,6 +33,7 @@ impl Host {
             tor_bin: String::new(),
             no_udp: true,
             web_dir: None,
+            web_tls: false,
         };
         tokio::spawn(async move {
             let _keep = clients_tx;
@@ -221,4 +222,130 @@ async fn web_member_never_sends_password_proof_to_unproven_host() {
     let mut sock = TcpStream::connect(&inv.addr).await.unwrap();
     let e = pump(&mut m, &mut sock, "nuked", |e| e["ev"] == "nuked").await;
     assert!(e["reason"].as_str().unwrap().contains("host failed identity proof"), "{e}");
+}
+
+fn noise_bytes(n: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(n + 8);
+    let mut x: u64 = 0x9e3779b97f4a7c15;
+    while v.len() < n {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    v.truncate(n);
+    v
+}
+
+async fn joined_member(tag: &str) -> (Host, Member, TcpStream, String) {
+    let (host, code, room) = host_with_room(tag, 15).await;
+    let addr = commx_core::invite::Invite::decode(&code).unwrap().addr;
+    let mut m = Member::new(&code, "webby", None).unwrap();
+    let mut sock = TcpStream::connect(&addr).await.unwrap();
+    pump(&mut m, &mut sock, "joined", |e| e["ev"] == "joined").await;
+    (host, m, sock, room)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_member_receives_a_file_and_verifies_it() {
+    let (host, mut m, mut sock, room) = joined_member("frecv").await;
+    let data = noise_bytes(3 * 32 * 1024 + 1234);
+    let src = std::env::temp_dir().join(format!("cx-web-{}-frecv.bin", std::process::id()));
+    std::fs::write(&src, &data).unwrap();
+    host.req(json!({"op": "send_file", "room_id": room, "path": src.to_str().unwrap()}));
+    let e = pump(&mut m, &mut sock, "file ready", |e| {
+        e["ev"] == "files" && e["list"][0]["ready"] == true
+    })
+    .await;
+    assert_eq!(e["list"][0]["name"], src.file_name().unwrap().to_str().unwrap());
+    assert_eq!(m.file_bytes(1).unwrap(), data);
+    assert!(m.file_bytes(2).is_none());
+    let _ = std::fs::remove_file(&src);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_member_sends_a_file_the_host_can_save() {
+    let (mut host, mut m, mut sock, room) = joined_member("fsend").await;
+    let data = noise_bytes(5 * 32 * 1024 + 7);
+    // A hostile page name is reduced to one safe component.
+    m.send_file("../../etc/report.bin", data.clone()).unwrap();
+    pump(&mut m, &mut sock, "sent", |e| e["ev"] == "line" && e["text"] == "📎 #1 sent").await;
+    host.expect("host has it", |v| {
+        v["ev"] == "line" && v["line"]["text"].as_str().unwrap().contains("#1 'report.bin' ready")
+    })
+    .await;
+    let out = std::env::temp_dir().join(format!("cx-web-{}-fsend-out", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).unwrap();
+    host.req(json!({"op": "save_file", "room_id": room, "no": 1, "dest": out.to_str().unwrap()}));
+    host.expect("saved", |v| v["ev"] == "ok" && v["msg"].as_str().unwrap().starts_with("saved #1")).await;
+    assert_eq!(std::fs::read(out.join("report.bin")).unwrap(), data);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// Unpack `Member::take_voice` output.
+fn frames(buf: &[u8]) -> Vec<(String, u64, Vec<u8>)> {
+    let (mut v, mut i) = (Vec::new(), 0);
+    while i < buf.len() {
+        let n = buf[i] as usize;
+        let name = String::from_utf8(buf[i + 1..i + 1 + n].to_vec()).unwrap();
+        i += 1 + n;
+        let seq = u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
+        let len = u16::from_le_bytes(buf[i + 8..i + 10].try_into().unwrap()) as usize;
+        v.push((name, seq, buf[i + 10..i + 10 + len].to_vec()));
+        i += 10 + len;
+    }
+    v
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_member_starts_a_call_and_talks_both_ways() {
+    let (mut host, mut m, mut sock, room) = joined_member("call").await;
+    m.start_call().unwrap();
+    pump(&mut m, &mut sock, "in the call", |e| e["ev"] == "call" && e["call"]["joined"] == true).await;
+    host.expect("call started", |v| v["ev"] == "line" && v["line"]["text"].as_str().unwrap().contains("webby started a call")).await;
+    host.req(json!({"op": "call", "room_id": room}));
+    pump(&mut m, &mut sock, "alice joined", |e| {
+        e["ev"] == "call" && e["call"]["participants"].as_array().is_some_and(|p| p.len() == 2)
+    })
+    .await;
+
+    // Host → browser.
+    let frame = |i: u8| [i; 60];
+    for i in 0..5u8 {
+        host.req(json!({"op": "voice_out", "room_id": room, "opus": hex::encode(frame(i))}));
+    }
+    let mut got = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut buf = vec![0u8; 65536];
+    while got.len() < 5 && std::time::Instant::now() < deadline {
+        let out = m.take_outgoing();
+        if !out.is_empty() {
+            sock.write_all(&out).await.unwrap();
+        }
+        if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(100), sock.read(&mut buf)).await {
+            m.on_bytes(&buf[..n]);
+        }
+        got.extend(frames(&m.take_voice()));
+    }
+    assert_eq!(got.len(), 5, "frames from alice");
+    for (i, (from, _, opus)) in got.iter().enumerate() {
+        assert_eq!(from, "alice");
+        assert_eq!(opus, &frame(i as u8));
+    }
+
+    // Browser → host.
+    for i in 0..3u8 {
+        m.send_voice(&frame(200 + i)).unwrap();
+        sock.write_all(&m.take(true, 0)).await.unwrap();
+    }
+    for i in 0..3u8 {
+        let want = hex::encode(frame(200 + i));
+        host.expect("voice from webby", |v| v["ev"] == "voice_in" && v["from"] == "webby" && v["opus"] == want).await;
+    }
+
+    // Leaving ends our part; the host sees it.
+    m.set_in_call(false).unwrap();
+    sock.write_all(&m.take_outgoing()).await.unwrap();
+    host.expect("left", |v| v["ev"] == "line" && v["line"]["text"].as_str().unwrap().contains("webby left the call")).await;
 }

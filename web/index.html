@@ -30,11 +30,19 @@
         <h2 id="room-name"></h2>
         <p id="room-meta" class="dim"></p>
       </div>
-      <button id="leave-btn" class="danger" type="button">Leave</button>
+      <div class="actions">
+        <button id="call-btn" type="button">Call</button>
+        <button id="mute-btn" type="button" hidden>Mute</button>
+        <button id="leave-btn" class="danger" type="button">Leave</button>
+      </div>
     </header>
     <p id="members" class="dim"></p>
+    <p id="call-info" class="call"></p>
+    <ul id="files" hidden></ul>
     <ol id="lines"></ol>
     <form id="send-form">
+      <button id="file-btn" type="button" title="Share a file (max 256 MiB)">📎</button>
+      <input id="file-input" type="file" hidden>
       <input id="msg" autocomplete="off" maxlength="8000" spellcheck="false" placeholder="message">
       <button type="submit">Send</button>
     </form>

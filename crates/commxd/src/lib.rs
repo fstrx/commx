@@ -51,6 +51,9 @@ pub struct Config {
     /// Serve the browser client (files in this dir) and accept browser
     /// members over WebSocket on the peer port.
     pub web_dir: Option<PathBuf>,
+    /// Serve the browser client over HTTPS (self-signed, per run). Browsers
+    /// only allow the microphone in a secure context.
+    pub web_tls: bool,
 }
 
 /// How UI clients reach the daemon.
@@ -123,8 +126,19 @@ pub async fn run(cfg: Config, control: Control, shutdown: impl Future<Output = (
     };
 
     let shared: Shared = Arc::new(Mutex::new(Daemon::new(data_dir, transport.clone(), cfg.keep_awake)));
-    lock(&shared).web = cfg.web_dir.is_some();
-    let web_dir = Arc::new(cfg.web_dir.clone());
+    let web = match cfg.web_dir.clone() {
+        Some(dir) => {
+            let tls = if cfg.web_tls { Some(web::Tls::generate(&transport.advertised())?) } else { None };
+            if let Some(t) = &tls {
+                eprintln!("web client over https; certificate SHA-256 {}", t.fingerprint);
+            }
+            let mut d = lock(&shared);
+            d.web = Some(state::WebInfo { https: tls.is_some(), cert: tls.as_ref().map(|t| t.fingerprint.clone()) });
+            Some(web::WebServe { dir, tls })
+        }
+        None => None,
+    };
+    let web_dir = Arc::new(web);
     // Voice fast path, direct mode only: Tor mode must never open UDP.
     if !cfg.tor && !cfg.no_udp {
         match tokio::net::UdpSocket::bind(bound).await {

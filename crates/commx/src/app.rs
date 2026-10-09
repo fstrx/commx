@@ -305,7 +305,7 @@ impl App {
                     );
                 }
             }
-            IpcEvent::InviteCode { room_id, name, code, web_link, reusable } => {
+            IpcEvent::InviteCode { room_id, name, code, web_link, web_cert, reusable } => {
                 let kind = if reusable {
                     "reusable until the room ends or /invite revoke; needs the password — send the password separately"
                 } else {
@@ -318,6 +318,13 @@ impl App {
                 if let Some(link) = web_link {
                     self.log(format!("browser link (same invite): {link}"), false);
                     self.local_line(&room_id, format!("or open in a browser: {link}"));
+                    if let Some(fp) = web_cert {
+                        let note = format!(
+                            "the browser will warn about a self-signed certificate: check its SHA-256 is {fp}"
+                        );
+                        self.log(note.clone(), false);
+                        self.local_line(&room_id, note);
+                    }
                 }
                 self.notice = Some(Notice { text: format!("invite ready for #{name}"), error: false });
             }

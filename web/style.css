@@ -22,3 +22,11 @@ header { display: flex; align-items: flex-start; justify-content: space-between;
 .mine { color: var(--accent); }
 .sys { color: var(--sys); font-style: italic; }
 .fp { font-family: ui-monospace, monospace; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.call { color: var(--accent); margin: 4px 0; }
+.call:empty { display: none; }
+#files { list-style: none; margin: 6px 0; padding: 8px 10px; background: var(--panel); border-radius: 8px; max-height: 30vh; overflow-y: auto; }
+#files li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 3px 0; word-break: break-all; }
+button.small { padding: 4px 10px; font-size: 13px; }
+#file-btn { padding: 10px 12px; background: transparent; border: 1px solid #2b3a35; color: var(--fg); }
+@media (max-width: 560px) { header { flex-direction: column; } .actions { justify-content: flex-start; } }

@@ -2,7 +2,7 @@
 //! RAM only. Locked with a std mutex and never held across an await.
 
 use anyhow::{anyhow, bail, Result};
-use commx_core::chain::{msg_aad, Block, Body, Chain, ChatPlain, FileMeta, Payload};
+use commx_core::chain::{file_meta_aad, msg_aad, Block, Body, Chain, ChatPlain, FileMeta, Payload};
 use commx_core::crypto::{aead_decrypt, aead_encrypt, open_sealed, seal_to, RoomKey};
 use commx_core::secmem::{Locked, SealedLog};
 use commx_core::identity::{verify, Identity};
@@ -87,13 +87,6 @@ pub fn human_size(n: u64) -> String {
         n if n >= 1 << 10 => format!("{:.1} KiB", n as f64 / 1024.0),
         n => format!("{n} B"),
     }
-}
-
-fn file_meta_aad(room_id: &RoomId, epoch: u32, author: &[u8; 32], file_id: &[u8; 16]) -> Vec<u8> {
-    let mut aad = msg_aad(room_id, epoch, author);
-    aad.extend_from_slice(b"file");
-    aad.extend_from_slice(file_id);
-    aad
 }
 
 pub fn lock(s: &Shared) -> MutexGuard<'_, Daemon> {
@@ -214,6 +207,13 @@ pub enum PeerKind {
     Member([u8; 32]),
     /// Seen by a member: the room host.
     Host,
+}
+
+/// How the browser client is served.
+pub struct WebInfo {
+    pub https: bool,
+    /// Certificate SHA-256 when `https`.
+    pub cert: Option<String>,
 }
 
 pub struct PendingInvite {
@@ -605,7 +605,7 @@ pub struct Daemon {
     /// Set in direct-TCP mode once the UDP socket is up.
     pub udp_out: Option<Outbox>,
     /// Browser client enabled (`--web`): invites also get a web link.
-    pub web: bool,
+    pub web: Option<WebInfo>,
     /// Test-only fault injection ("tick-task"); inert in release builds.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub fault: Option<String>,
@@ -624,7 +624,7 @@ impl Daemon {
             invites: HashMap::new(),
             udp_index: HashMap::new(),
             udp_out: None,
-            web: false,
+            web: None,
             fault: None,
             events: Events::new(),
             power: Power::new(keep_awake),

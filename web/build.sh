@@ -7,5 +7,5 @@ cd "$(dirname "$0")"
 cargo build --release -p commx-web --target wasm32-unknown-unknown --manifest-path ../Cargo.toml
 rm -rf dist && mkdir -p dist
 wasm-bindgen --target web --no-typescript --out-dir dist ../target/wasm32-unknown-unknown/release/commx_web.wasm
-cp index.html app.js style.css dist/
+cp index.html app.js audio.js style.css dist/
 echo "built: $(du -sh dist | cut -f1) in web/dist"

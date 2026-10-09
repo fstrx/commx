@@ -91,6 +91,7 @@ impl Bridge {
             tor_bin: String::new(),
             no_udp: opts.no_udp,
             web_dir: None,
+            web_tls: false,
         };
         let node = rt.spawn(async move {
             let _keep = clients_tx;

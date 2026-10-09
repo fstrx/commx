@@ -40,6 +40,11 @@ struct Args {
     /// rooms from a web browser (members only).
     #[arg(long)]
     web: Option<PathBuf>,
+    /// Serve the browser client over HTTPS with a self-signed certificate
+    /// made fresh each run (needed for voice in browsers). Friends see a
+    /// certificate warning once; the fingerprint is shown with invites.
+    #[arg(long, requires = "web")]
+    web_tls: bool,
     /// Don't use the UDP voice fast path (e.g. UDP is blocked); calls use TCP.
     #[arg(long)]
     no_udp: bool,
@@ -110,6 +115,7 @@ async fn main() -> Result<()> {
         tor_bin: args.tor_bin,
         no_udp: args.no_udp,
         web_dir: args.web,
+        web_tls: args.web_tls,
     };
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {

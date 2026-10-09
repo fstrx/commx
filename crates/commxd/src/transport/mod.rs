@@ -114,6 +114,14 @@ impl Net {
         }
     }
 
+    /// Our direct address (empty in Tor mode, where rooms have onions).
+    pub fn advertised(&self) -> String {
+        match &self.mode {
+            Mode::Tcp { advertise } => advertise.clone(),
+            Mode::Tor { .. } => String::new(),
+        }
+    }
+
     /// Short description for the status bar.
     pub fn label(&self) -> String {
         match &self.mode {

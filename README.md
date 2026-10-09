@@ -49,21 +49,24 @@ Install `commx-android.apk` from a release (Android 8.0+, arm64 or x86_64). It's
 
 ### Web browser (join only)
 
-The host runs `commxd --web web/` (release zips include `web/`; from source, run `web/build.sh` and pass `web/dist`). Every invite then also gets a browser link, `http://<host>:4700/#cx1:...`. Your friend opens it, picks an alias and is in the room.
+The host runs `commxd --web web/ --web-tls` (release zips include `web/`; from source, run `web/build.sh` and pass `web/dist`). Every invite then also gets a browser link, `https://<host>:4700/#cx1:...`. Your friend opens it, picks an alias and is in the room: chat, files and voice calls.
 - **The host's node serves the page.** The browser connects back to that node over a WebSocket, on the same port as normal peers.
-- **Same protocol, same crypto.** The browser runs the commx protocol compiled to WebAssembly: the Noise handshake, the signed chain and the room keys, checked against the host fingerprint in the invite. The invite rides in the link's `#` part, which browsers never send to any server, and the page erases it from the address bar as soon as it's read.
+- **Same protocol, same crypto.** The browser runs the commx protocol compiled to WebAssembly: the Noise handshake, the signed chain, room keys, file and call encryption. Everything is checked against the host fingerprint in the invite. The invite rides in the link's `#` part, which browsers never send to any server, and the page erases it from the address bar as soon as it's read.
+- **`--web-tls`: HTTPS with a self-signed certificate,** made fresh in RAM each run. Browsers only allow the microphone over HTTPS, so voice needs it. Friends get a certificate warning the first time. The host's invite shows the certificate's SHA-256, so they can compare it with the one in the browser's certificate details before clicking through. Plain `http://` requests are redirected to `https://`. Without `--web-tls`, chat and files work, but calls don't.
+- **Files.** Files are sent and received with the same chunk encryption and hash check as the apps. A received file stays decrypted in the tab's memory only (512 MiB for all files together) until you press Save or the room ends. Once you save it, the browser's download is an ordinary file on disk.
+- **Voice.** Calls use Opus at 24 kb/s hard CBR in 20 ms frames, the same as the apps, through the browser's built-in WebCodecs, with constant-size frames sent continuously, silence included. This needs a current Chrome, Edge, Firefox or Safari. Use headphones to avoid echo.
 - **Members only.** A web page can't accept connections, so browser users can join rooms but can't host them.
 - **Nothing is stored.** The identity lives in RAM only.
 - **Leaving.** Closing the tab leaves the room, and the kill switch applies. Background tabs stay connected because the client answers the host's heartbeats instead of relying on timers.
-- **Text chat only for now.** File and call notices show up, but receiving files and voice need the desktop or Android app.
-- **Use a network you trust, or Tor.** Over plain `http://`, an attacker on the network between your friend and you could swap the page's code. Use it on a LAN or VPN you trust, such as Tailscale. Or run the host with `--tor`, and the friend opens the onion link in Tor Browser, where the onion address itself authenticates the server.
+- **Trust.** Over plain `http://`, an attacker on the network between your friend and you could swap the page's code. `--web-tls` stops that, as long as the certificate fingerprint is checked. Otherwise use a LAN or VPN you trust, such as Tailscale. Or run the host with `--tor`, and the friend opens the onion link in Tor Browser, where the onion address itself authenticates the server.
 
 ## Use
 
 ```
 /alias new ghost --ephemeral        RAM-only identity (drop --ephemeral to save it, passphrase-encrypted)
 /room new lounge --any-member       host a room; prints a single-use invite (cx1:...)
-/join cx1:...                       join a friend's room
+/invite pw   /invite revoke         reusable invite that needs a password (cx2:...) / kill it
+/join cx1:...                       join a friend's room (cx2: asks for the password)
 /send ~/notes.pdf                   share a file (max 256 MiB)
 /files   /save 1 [path]             list files / export a decrypted copy
 /call    /hangup   /mute            start or join the room's voice call / leave / mute
@@ -71,6 +74,8 @@ The host runs `commxd --web web/` (release zips include `web/`; from source, run
 /devices /mic 2  /speaker 1         list and pick audio devices
 /nuke    /nuke all                  destroy this room / everything
 ```
+
+**Invites.** A `cx1:` invite is single use and expires after 10 minutes. A `cx2:` invite can be used again and again until the room ends or you revoke it, but only with its password. Send the password over a different channel from the code. The password never crosses the network: joiners prove they know it with a key derived from it (Argon2id) and bound to the encrypted connection. They only send that proof after the host has proven, on the same connection, that it is the invite's host, so someone intercepting the connection gets nothing to guess against offline. Five wrong passwords in 10 minutes pause the invite, and the host sees every failed attempt.
 
 Send invite codes over a channel you trust. Each side shows a fingerprint for the other (`[abcd-efgh-...]`); compare fingerprints once, out of band. Panic button from any shell: `commx nuke`.
 
@@ -184,6 +189,7 @@ Limits: text is plaintext while it's on screen. Your terminal emulator holds wha
 | transport | Noise `XX_25519_ChaChaPoly_BLAKE2s` with a fresh node key per run. Aliases sign the handshake hash (channel binding). |
 | room | XChaCha20-Poly1305 room key, sealed to each member and rotated on removal. |
 | "blockchain" | Per-room hash chain, double-signed (author + host). Members reject gaps, reorders, forgeries and splices, and nuke the room if verification fails. It lives only in RAM. |
+| password invites | Argon2id (19 MiB, t=2) of the password, salted with room and token. A keyed BLAKE3 proof bound to the Noise handshake hash, sent only after the host signs that same channel. |
 | saved aliases | Argon2id (64 MiB, t=3) → XChaCha20-Poly1305, with authenticated parameters. Files have random names and sit in a private directory. |
 
 See [SECURITY.md](SECURITY.md) for the audit and known limits.

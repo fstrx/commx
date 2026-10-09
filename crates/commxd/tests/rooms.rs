@@ -731,3 +731,35 @@ fn password_proof_is_never_sent_to_an_unproven_host() {
     let h = a.expect("history", 5, |v| v["ev"] == "history");
     assert!(!h.to_string().contains("wrong password"), "{h}");
 }
+
+#[test]
+fn web_tls_port_still_takes_native_peers_and_redirects_http() {
+    let dir = std::env::temp_dir().join(format!("cx-{}-tls-a", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let web = std::env::temp_dir().join(format!("cx-{}-tls-web", std::process::id()));
+    std::fs::create_dir_all(&web).unwrap();
+    let mut a = Node::spawn_with(dir, &["--web", web.to_str().unwrap(), "--web-tls"]);
+    let mut b = Node::spawn("tls-b");
+    a.alias("alice");
+    b.alias("bob");
+    a.req(json!({"op": "room_new", "name": "lounge", "kill_mode": "HostOnly", "grace_secs": 15, "dm": false}));
+    let inv = a.expect("invite", 5, |v| v["ev"] == "invite_code");
+    let (room, code) = (inv["room_id"].as_str().unwrap().to_string(), inv["code"].as_str().unwrap().to_string());
+    assert!(inv["web_link"].as_str().unwrap().starts_with("https://"), "{inv}");
+    assert_eq!(inv["web_cert"].as_str().unwrap().len(), 32 * 3 - 1, "{inv}");
+
+    // Native peers share the port with HTTPS.
+    b.join(&code);
+    a.send(&room, "over noise");
+    b.expect_msg("alice", "over noise");
+
+    // Plain http only redirects; it never serves the client.
+    let addr = commx_core::invite::Invite::decode(&code).unwrap().addr;
+    let mut s = std::net::TcpStream::connect(&addr).unwrap();
+    write!(s, "GET /app.js HTTP/1.1\r\nHost: {addr}\r\n\r\n").unwrap();
+    let mut resp = String::new();
+    std::io::Read::read_to_string(&mut s, &mut resp).unwrap();
+    assert!(resp.starts_with("HTTP/1.1 308"), "{resp}");
+    assert!(resp.contains(&format!("Location: https://{addr}/app.js")), "{resp}");
+    let _ = std::fs::remove_dir_all(&web);
+}

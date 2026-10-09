@@ -150,7 +150,12 @@ fn save_path(dest: &std::path::Path, name: &str) -> Result<std::path::PathBuf> {
 /// browsers never send to any server.
 fn web_link(d: &crate::state::Daemon, id: &RoomId, code: &str) -> Option<String> {
     let room = d.rooms.get(id)?;
-    d.web.then(|| format!("http://{}/#{code}", room.addr))
+    let web = d.web.as_ref()?;
+    Some(format!("{}://{}/#{code}", if web.https { "https" } else { "http" }, room.addr))
+}
+
+fn web_cert(d: &crate::state::Daemon) -> Option<String> {
+    d.web.as_ref().and_then(|w| w.cert.clone())
 }
 
 fn room_arg(s: &str) -> Result<RoomId> {
@@ -235,7 +240,7 @@ async fn handle(
             }
             let code = d.make_invite(&id)?;
             let web_link = web_link(&d, &id, &code);
-            let _ = tx.send(IpcEvent::InviteCode { room_id: room_id_hex(&id), name, code, web_link, reusable: false });
+            let _ = tx.send(IpcEvent::InviteCode { room_id: room_id_hex(&id), name, code, web_link, web_cert: web_cert(&d), reusable: false });
         }
         IpcRequest::Invite { room_id } => {
             let id = room_arg(&room_id)?;
@@ -243,7 +248,7 @@ async fn handle(
             let code = d.make_invite(&id)?;
             let name = d.rooms[&id].cfg.name.clone();
             let web_link = web_link(&d, &id, &code);
-            let _ = tx.send(IpcEvent::InviteCode { room_id, name, code, web_link, reusable: false });
+            let _ = tx.send(IpcEvent::InviteCode { room_id, name, code, web_link, web_cert: web_cert(&d), reusable: false });
         }
         IpcRequest::InvitePassword { room_id, password } => {
             let id = room_arg(&room_id)?;
@@ -259,7 +264,7 @@ async fn handle(
             let code = d.install_pw_invite(&id, token, key)?;
             let name = d.rooms[&id].cfg.name.clone();
             let web_link = web_link(&d, &id, &code);
-            let _ = tx.send(IpcEvent::InviteCode { room_id, name, code, web_link, reusable: true });
+            let _ = tx.send(IpcEvent::InviteCode { room_id, name, code, web_link, web_cert: web_cert(&d), reusable: true });
         }
         IpcRequest::InviteRevoke { room_id } => {
             let id = room_arg(&room_id)?;

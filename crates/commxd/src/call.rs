@@ -12,7 +12,7 @@
 //! attributed to someone else. Per-frame signatures would double bandwidth.
 
 use anyhow::{anyhow, bail, Result};
-use commx_core::chain::{msg_aad, Body, Payload};
+use commx_core::chain::{call_meta_aad, Body, Payload};
 use commx_core::ipc::{CallInfo, IpcEvent};
 use commx_core::room_id_hex;
 use commx_core::secmem::Locked;
@@ -64,13 +64,6 @@ impl Call {
     }
 }
 
-fn call_meta_aad(room: &Room, p: &Payload, call_id: &[u8; 16]) -> Vec<u8> {
-    let mut aad = msg_aad(&room.id, p.epoch, &p.author);
-    aad.extend_from_slice(b"call");
-    aad.extend_from_slice(call_id);
-    aad
-}
-
 impl Room {
     pub fn call_info(&self) -> Option<CallInfo> {
         let me = self.me.public().sign_pk;
@@ -90,7 +83,7 @@ impl Room {
 
     pub fn open_call_meta(&self, p: &Payload, call_id: &[u8; 16], nonce: &[u8; 24], ct: &[u8]) -> Result<CallMeta> {
         let key = self.keys.get(&p.epoch).ok_or_else(|| anyhow!("unknown key epoch {}", p.epoch))?;
-        let plain = key.decrypt(nonce, ct, &call_meta_aad(self, p, call_id))?;
+        let plain = key.decrypt(nonce, ct, &call_meta_aad(&self.id, p.epoch, &p.author, call_id))?;
         Ok(postcard::from_bytes(&plain)?)
     }
 
@@ -120,10 +113,7 @@ impl Room {
         let key = self.keys.get(&self.epoch).ok_or_else(|| anyhow!("no room key"))?;
         let plain = Zeroizing::new(postcard::to_allocvec(&meta)?);
         let me_pk = self.me.public().sign_pk;
-        let mut aad = msg_aad(&self.id, self.epoch, &me_pk);
-        aad.extend_from_slice(b"call");
-        aad.extend_from_slice(&call_id);
-        let (nonce, ct) = key.encrypt(&plain, &aad)?;
+        let (nonce, ct) = key.encrypt(&plain, &call_meta_aad(&self.id, self.epoch, &me_pk, &call_id))?;
         let payload = Payload::new(&self.me, self.id, self.epoch, Body::Call { call_id, nonce, ct });
         match &self.role {
             Role::Host { .. } => self.publish(ev, payload),

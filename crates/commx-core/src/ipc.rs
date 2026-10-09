@@ -116,6 +116,9 @@ pub enum IpcEvent {
         /// Browser join link, when the host serves the web client.
         #[serde(default)]
         web_link: Option<String>,
+        /// SHA-256 of the web client's self-signed certificate (`--web-tls`).
+        #[serde(default)]
+        web_cert: Option<String>,
         /// Reusable password invite (`cx2:`) rather than single use.
         #[serde(default)]
         reusable: bool,

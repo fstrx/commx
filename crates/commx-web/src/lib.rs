@@ -8,6 +8,7 @@
 //! Limits, by the nature of browsers: members only (a page can't accept
 //! connections), RAM-only identity, and closing the tab is a node drop.
 
+mod media;
 pub mod member;
 
 pub use member::Member;
@@ -41,9 +42,46 @@ mod js {
             self.inner.fingerprint()
         }
 
-        /// Bytes to send over the WebSocket (may be empty).
-        pub fn outgoing(&mut self) -> Vec<u8> {
-            self.inner.take_outgoing()
+        /// Bytes to send over the WebSocket (may be empty): control frames,
+        /// plus queued voice if `media`, plus file chunks up to about
+        /// `bulk_budget` bytes. Send them right away, in this order.
+        pub fn outgoing(&mut self, media: bool, bulk_budget: u32) -> Vec<u8> {
+            self.inner.take(media, bulk_budget as usize)
+        }
+
+        pub fn bulk_pending(&self) -> bool {
+            self.inner.bulk_pending()
+        }
+
+        pub fn send_file(&mut self, name: &str, data: Vec<u8>) -> Result<(), JsError> {
+            self.inner.send_file(name, data).map_err(|e| JsError::new(&format!("{e:#}")))
+        }
+
+        /// Verified contents of file `no` (undefined until it's ready).
+        pub fn file_bytes(&self, no: u32) -> Option<Vec<u8>> {
+            self.inner.file_bytes(no)
+        }
+
+        pub fn file_name(&self, no: u32) -> Option<String> {
+            self.inner.file_name(no)
+        }
+
+        pub fn start_call(&mut self) -> Result<(), JsError> {
+            self.inner.start_call().map_err(|e| JsError::new(&format!("{e:#}")))
+        }
+
+        pub fn set_in_call(&mut self, joined: bool) -> Result<(), JsError> {
+            self.inner.set_in_call(joined).map_err(|e| JsError::new(&format!("{e:#}")))
+        }
+
+        /// One 20 ms Opus packet from the microphone.
+        pub fn send_voice(&mut self, opus: &[u8]) -> Result<(), JsError> {
+            self.inner.send_voice(opus).map_err(|e| JsError::new(&format!("{e:#}")))
+        }
+
+        /// Received frames, packed `[u8 name_len][name][u64 seq][u16 len][opus]`.
+        pub fn voice(&mut self) -> Vec<u8> {
+            self.inner.take_voice()
         }
 
         /// Feed bytes received from the WebSocket.

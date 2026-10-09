@@ -138,16 +138,19 @@ pub async fn handle_inbound(
     transport: Arc<Net>,
     stream: TcpStream,
     permit: OwnedSemaphorePermit,
-    web_dir: Arc<Option<std::path::PathBuf>>,
+    web: Arc<Option<crate::web::WebServe>>,
 ) {
-    // Browsers speak HTTP first: serve the client, or bridge a WebSocket into
-    // the same peer path below. Everyone else speaks Noise directly.
-    let conn = match web_dir.as_ref() {
-        Some(dir) if crate::web::looks_like_http(&stream).await => match crate::web::accept(stream, dir).await {
-            Ok(Some(ws)) => transport.respond_boxed(Box::new(ws)).await,
-            _ => return,
+    // Browsers speak HTTP (or TLS) first: serve the client, or bridge a
+    // WebSocket into the same peer path below. Peers speak Noise directly.
+    let conn = match web.as_ref() {
+        Some(w) => match crate::web::sniff(&stream).await {
+            crate::web::Sniff::Peer => transport.respond(stream).await,
+            kind => match crate::web::serve(stream, kind, w).await {
+                Ok(Some(ws)) => transport.respond_boxed(Box::new(ws)).await,
+                _ => return,
+            },
         },
-        _ => transport.respond(stream).await,
+        None => transport.respond(stream).await,
     };
     let Ok(conn) = conn else { return };
     let mut reader = conn.reader;

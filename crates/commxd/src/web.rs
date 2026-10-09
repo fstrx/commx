@@ -7,8 +7,9 @@
 //! kill-switch code as any other peer. Nothing here is trusted: the browser
 //! still has to present a valid invite inside the encrypted channel.
 
-use anyhow::{bail, Context, Result};
-use std::path::Path;
+use anyhow::{anyhow, bail, Context, Result};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -23,6 +24,7 @@ const FILES: &[(&str, &str, &str)] = &[
     ("/", "index.html", "text/html; charset=utf-8"),
     ("/index.html", "index.html", "text/html; charset=utf-8"),
     ("/app.js", "app.js", "text/javascript; charset=utf-8"),
+    ("/audio.js", "audio.js", "text/javascript; charset=utf-8"),
     ("/style.css", "style.css", "text/css; charset=utf-8"),
     ("/commx_web.js", "commx_web.js", "text/javascript; charset=utf-8"),
     ("/commx_web_bg.wasm", "commx_web_bg.wasm", "application/wasm"),
@@ -32,13 +34,96 @@ const SECURITY_HEADERS: &str = "Referrer-Policy: no-referrer\r\n\
 X-Content-Type-Options: nosniff\r\n\
 Cross-Origin-Opener-Policy: same-origin\r\n\
 Cross-Origin-Resource-Policy: same-origin\r\n\
-Permissions-Policy: camera=(), microphone=(), geolocation=()\r\n\
+Permissions-Policy: camera=(), microphone=(self), geolocation=()\r\n\
 Cache-Control: no-store\r\n";
 
-/// Does this connection start with an HTTP request (vs. a Noise frame)?
-pub async fn looks_like_http(stream: &TcpStream) -> bool {
+/// The browser client, as configured by `--web` / `--web-tls`.
+pub struct WebServe {
+    pub dir: PathBuf,
+    /// HTTPS with a self-signed certificate made at startup (RAM only).
+    pub tls: Option<Tls>,
+}
+
+pub struct Tls {
+    pub acceptor: tokio_rustls::TlsAcceptor,
+    /// SHA-256 of the certificate, `AA:BB:...`: what browsers show under
+    /// "certificate details", so friends can check they reached the real node.
+    pub fingerprint: String,
+}
+
+impl Tls {
+    /// Fresh key and certificate for this run. Never written anywhere.
+    pub fn generate(host: &str) -> Result<Self> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let name = host.rsplit_once(':').map_or(host, |(h, _)| h).trim_matches(['[', ']']).to_string();
+        let mut names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+        let ck = rcgen::generate_simple_self_signed(names).map_err(|e| anyhow!("tls cert: {e}"))?;
+        let der = ck.cert.der().clone();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.signing_key.serialize_der().into());
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![der.clone()], key)
+            .map_err(|e| anyhow!("tls config: {e}"))?;
+        use sha2::Digest;
+        let fingerprint = sha2::Sha256::digest(der.as_ref()).iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":");
+        Ok(Self { acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)), fingerprint })
+    }
+}
+
+pub enum Sniff {
+    Http,
+    Tls,
+    /// Anything else: a peer's Noise handshake.
+    Peer,
+}
+
+/// What does this connection start with? Peer frames start with a 4-byte
+/// big-endian length (first byte 0), TLS with 0x16, HTTP with a method.
+pub async fn sniff(stream: &TcpStream) -> Sniff {
     let mut b = [0u8; 4];
-    matches!(tokio::time::timeout(HTTP_TIMEOUT, stream.peek(&mut b)).await, Ok(Ok(4)) if &b == b"GET ")
+    match tokio::time::timeout(HTTP_TIMEOUT, stream.peek(&mut b)).await {
+        Ok(Ok(4)) if &b == b"GET " => Sniff::Http,
+        Ok(Ok(n)) if n >= 1 && b[0] == 0x16 => Sniff::Tls,
+        _ => Sniff::Peer,
+    }
+}
+
+/// A browser connection (plain or TLS). Returns a byte stream if it became a
+/// WebSocket, to be handed to the normal peer code.
+pub async fn serve(stream: TcpStream, kind: Sniff, web: &WebServe) -> Result<Option<tokio::io::DuplexStream>> {
+    match (kind, &web.tls) {
+        (Sniff::Tls, Some(tls)) => {
+            let s = tokio::time::timeout(HTTP_TIMEOUT, tls.acceptor.accept(stream)).await.context("slow tls")??;
+            accept(s, web, true).await
+        }
+        (Sniff::Http, Some(_)) => {
+            redirect_to_https(stream).await?;
+            Ok(None)
+        }
+        (Sniff::Http, None) => accept(stream, web, false).await,
+        _ => Ok(None),
+    }
+}
+
+/// `--web-tls`: plain http only points at https (the fragment survives).
+async fn redirect_to_https(mut stream: TcpStream) -> Result<()> {
+    let req = tokio::time::timeout(HTTP_TIMEOUT, read_head(&mut stream)).await.context("slow request")??;
+    let path = req.path.split(['?', '#']).next().unwrap_or("/");
+    let path = if FILES.iter().any(|(p, ..)| *p == path) { path } else { "/" };
+    match req.host.as_deref().filter(|h| plain_host(h)) {
+        Some(h) => {
+            let head = format!(
+                "HTTP/1.1 308 Permanent Redirect\r\nLocation: https://{h}{path}\r\nContent-Length: 0\r\n{SECURITY_HEADERS}Connection: close\r\n\r\n"
+            );
+            stream.write_all(head.as_bytes()).await?;
+            stream.flush().await?;
+        }
+        None => respond(&mut stream, None, "400 Bad Request", "text/plain", b"use https").await?,
+    }
+    Ok(())
 }
 
 struct Request {
@@ -49,7 +134,7 @@ struct Request {
     upgrade: bool,
 }
 
-async fn read_head(stream: &mut TcpStream) -> Result<Request> {
+async fn read_head<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Request> {
     let mut head = Vec::with_capacity(1024);
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
@@ -101,7 +186,7 @@ connect-src 'self'{ws}; img-src 'self' data:; base-uri 'none'; form-action 'none
     )
 }
 
-async fn respond(stream: &mut TcpStream, host: Option<&str>, status: &str, ctype: &str, body: &[u8]) -> Result<()> {
+async fn respond<S: AsyncWrite + Unpin>(stream: &mut S, host: Option<&str>, status: &str, ctype: &str, body: &[u8]) -> Result<()> {
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n{}{SECURITY_HEADERS}Connection: close\r\n\r\n",
         body.len(),
@@ -115,9 +200,10 @@ async fn respond(stream: &mut TcpStream, host: Option<&str>, status: &str, ctype
 
 /// Same-origin check for the WebSocket upgrade: another website can't make a
 /// visitor's browser talk to this node.
-fn same_origin(req: &Request) -> bool {
+fn same_origin(req: &Request, https: bool) -> bool {
+    let scheme = if https { "https://" } else { "http://" };
     match (&req.origin, &req.host) {
-        (Some(o), Some(h)) => o.strip_prefix("http://").or_else(|| o.strip_prefix("https://")) == Some(h.as_str()),
+        (Some(o), Some(h)) => o.strip_prefix(scheme) == Some(h.as_str()),
         _ => false,
     }
 }
@@ -132,12 +218,16 @@ fn ws_accept(key: &str) -> String {
 
 /// Handle an HTTP connection. Returns a byte stream if it became a WebSocket
 /// (to be handed to the normal peer code), or None if a file was served.
-pub async fn accept(mut stream: TcpStream, dir: &Path) -> Result<Option<tokio::io::DuplexStream>> {
+async fn accept<S>(mut stream: S, web: &WebServe, https: bool) -> Result<Option<tokio::io::DuplexStream>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let dir = &web.dir;
     let req = tokio::time::timeout(HTTP_TIMEOUT, read_head(&mut stream)).await.context("slow request")??;
     let path = req.path.split(['?', '#']).next().unwrap_or("");
     let host = req.host.as_deref();
     if path == "/ws" {
-        let (true, Some(key), true) = (req.upgrade, req.ws_key.as_deref(), same_origin(&req)) else {
+        let (true, Some(key), true) = (req.upgrade, req.ws_key.as_deref(), same_origin(&req, https)) else {
             respond(&mut stream, host, "403 Forbidden", "text/plain", b"forbidden").await?;
             return Ok(None);
         };
@@ -159,9 +249,12 @@ pub async fn accept(mut stream: TcpStream, dir: &Path) -> Result<Option<tokio::i
 }
 
 /// Bridge WebSocket binary messages <-> a plain byte stream.
-fn bridge(stream: TcpStream) -> tokio::io::DuplexStream {
+fn bridge<S>(stream: S) -> tokio::io::DuplexStream
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (ours, theirs) = tokio::io::duplex(256 * 1024);
-    let (mut net_r, mut net_w) = stream.into_split();
+    let (mut net_r, mut net_w) = tokio::io::split(stream);
     let (mut pipe_r, mut pipe_w) = tokio::io::split(ours);
     let (pong_tx, mut pong_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     // WebSocket → bytes
@@ -275,8 +368,12 @@ mod tests {
             ws_key: None,
             upgrade: true,
         };
-        assert!(same_origin(&req(Some("http://10.0.0.5:4700"), Some("10.0.0.5:4700"))));
-        assert!(!same_origin(&req(Some("http://evil.example"), Some("10.0.0.5:4700"))));
-        assert!(!same_origin(&req(None, Some("10.0.0.5:4700"))));
+        assert!(same_origin(&req(Some("http://10.0.0.5:4700"), Some("10.0.0.5:4700")), false));
+        assert!(same_origin(&req(Some("https://10.0.0.5:4700"), Some("10.0.0.5:4700")), true));
+        // An http page can't drive the https endpoint, nor the reverse.
+        assert!(!same_origin(&req(Some("http://10.0.0.5:4700"), Some("10.0.0.5:4700")), true));
+        assert!(!same_origin(&req(Some("https://10.0.0.5:4700"), Some("10.0.0.5:4700")), false));
+        assert!(!same_origin(&req(Some("http://evil.example"), Some("10.0.0.5:4700")), false));
+        assert!(!same_origin(&req(None, Some("10.0.0.5:4700")), false));
     }
 }
