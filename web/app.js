@@ -102,8 +102,12 @@ function handle(e) {
 
 function pump() {
   if (!member) return;
-  const out = member.outgoing();
-  if (out.length && ws && ws.readyState === WebSocket.OPEN) ws.send(out);
+  // Only drain outgoing bytes once they can be sent; until the socket is
+  // open they stay queued inside the member (dropping them stalls the join).
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    const out = member.outgoing();
+    if (out.length) ws.send(out);
+  }
   for (const e of JSON.parse(member.events())) handle(e);
 }
 
@@ -119,12 +123,23 @@ function connect(alias) {
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${scheme}//${location.host}/ws`);
   ws.binaryType = 'arraybuffer';
-  ws.onopen = pump;
+  let opened = false;
+  ws.onopen = () => {
+    opened = true;
+    pump();
+  };
   ws.onmessage = (ev) => {
     member.receive(new Uint8Array(ev.data));
     pump();
   };
   ws.onclose = () => {
+    if (!opened) {
+      // Never connected: blocked or refused, not a host drop.
+      member = null;
+      setStatus("couldn't connect to the host (connection refused or blocked by the browser)", true);
+      $('join-btn').disabled = false;
+      return;
+    }
     if (member) {
       member.closed();
       pump();

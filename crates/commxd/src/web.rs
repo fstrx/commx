@@ -28,9 +28,7 @@ const FILES: &[(&str, &str, &str)] = &[
     ("/commx_web_bg.wasm", "commx_web_bg.wasm", "application/wasm"),
 ];
 
-const SECURITY_HEADERS: &str = "Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; \
-style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n\
-Referrer-Policy: no-referrer\r\n\
+const SECURITY_HEADERS: &str = "Referrer-Policy: no-referrer\r\n\
 X-Content-Type-Options: nosniff\r\n\
 Cross-Origin-Opener-Policy: same-origin\r\n\
 Cross-Origin-Resource-Policy: same-origin\r\n\
@@ -85,10 +83,29 @@ async fn read_head(stream: &mut TcpStream) -> Result<Request> {
     Ok(req)
 }
 
-async fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> Result<()> {
+/// Is this a plain `host[:port]` (no spaces, quotes or `;`), safe to put in a header?
+fn plain_host(h: &str) -> bool {
+    !h.is_empty() && h.len() <= 255 && h.bytes().all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b))
+}
+
+/// `connect-src 'self'` should cover our own `ws://`, but Safari (WebKit bug
+/// 201591) doesn't apply it to WebSockets, so name the exact origin too.
+fn csp(host: Option<&str>) -> String {
+    let ws = match host {
+        Some(h) if plain_host(h) => format!(" ws://{h} wss://{h}"),
+        _ => String::new(),
+    };
+    format!(
+        "Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; \
+connect-src 'self'{ws}; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n"
+    )
+}
+
+async fn respond(stream: &mut TcpStream, host: Option<&str>, status: &str, ctype: &str, body: &[u8]) -> Result<()> {
     let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n{SECURITY_HEADERS}Connection: close\r\n\r\n",
-        body.len()
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n{}{SECURITY_HEADERS}Connection: close\r\n\r\n",
+        body.len(),
+        csp(host)
     );
     stream.write_all(head.as_bytes()).await?;
     stream.write_all(body).await?;
@@ -118,9 +135,10 @@ fn ws_accept(key: &str) -> String {
 pub async fn accept(mut stream: TcpStream, dir: &Path) -> Result<Option<tokio::io::DuplexStream>> {
     let req = tokio::time::timeout(HTTP_TIMEOUT, read_head(&mut stream)).await.context("slow request")??;
     let path = req.path.split(['?', '#']).next().unwrap_or("");
+    let host = req.host.as_deref();
     if path == "/ws" {
         let (true, Some(key), true) = (req.upgrade, req.ws_key.as_deref(), same_origin(&req)) else {
-            respond(&mut stream, "403 Forbidden", "text/plain", b"forbidden").await?;
+            respond(&mut stream, host, "403 Forbidden", "text/plain", b"forbidden").await?;
             return Ok(None);
         };
         let head = format!(
@@ -132,10 +150,10 @@ pub async fn accept(mut stream: TcpStream, dir: &Path) -> Result<Option<tokio::i
     }
     match FILES.iter().find(|(p, ..)| *p == path) {
         Some((_, file, ctype)) => match tokio::fs::read(dir.join(file)).await {
-            Ok(body) => respond(&mut stream, "200 OK", ctype, &body).await?,
-            Err(_) => respond(&mut stream, "404 Not Found", "text/plain", b"web client not installed").await?,
+            Ok(body) => respond(&mut stream, host, "200 OK", ctype, &body).await?,
+            Err(_) => respond(&mut stream, host, "404 Not Found", "text/plain", b"web client not installed").await?,
         },
-        None => respond(&mut stream, "404 Not Found", "text/plain", b"not found").await?,
+        None => respond(&mut stream, host, "404 Not Found", "text/plain", b"not found").await?,
     }
     Ok(None)
 }
@@ -236,6 +254,16 @@ mod tests {
     #[test]
     fn websocket_accept_key_matches_rfc6455_example() {
         assert_eq!(ws_accept("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+
+    #[test]
+    fn csp_names_own_websocket_origin_only_for_plain_hosts() {
+        assert!(csp(Some("192.168.1.19:4700")).contains("connect-src 'self' ws://192.168.1.19:4700 wss://192.168.1.19:4700;"));
+        assert!(csp(Some("[::1]:4700")).contains("ws://[::1]:4700"));
+        for evil in ["a; script-src *", "a b", "a'b", "x\r\nSet-Cookie: y", ""] {
+            assert!(csp(Some(evil)).contains("connect-src 'self';"), "{evil:?}");
+        }
+        assert!(csp(None).contains("connect-src 'self';"));
     }
 
     #[test]
