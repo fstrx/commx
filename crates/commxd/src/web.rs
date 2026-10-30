@@ -7,9 +7,8 @@
 //! kill-switch code as any other peer. Nothing here is trusted: the browser
 //! still has to present a valid invite inside the encrypted channel.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -45,6 +44,7 @@ pub struct WebServe {
 }
 
 pub struct Tls {
+    #[cfg(feature = "web-tls")]
     pub acceptor: tokio_rustls::TlsAcceptor,
     /// SHA-256 of the certificate, `AA:BB:...`: what browsers show under
     /// "certificate details", so friends can check they reached the real node.
@@ -53,6 +53,7 @@ pub struct Tls {
 
 impl Tls {
     /// Fresh key and certificate for this run. Never written anywhere.
+    #[cfg(feature = "web-tls")]
     pub fn generate(host: &str) -> Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let name = host.rsplit_once(':').map_or(host, |(h, _)| h).trim_matches(['[', ']']).to_string();
@@ -60,16 +61,21 @@ impl Tls {
         if !name.is_empty() && !names.contains(&name) {
             names.push(name);
         }
-        let ck = rcgen::generate_simple_self_signed(names).map_err(|e| anyhow!("tls cert: {e}"))?;
+        let ck = rcgen::generate_simple_self_signed(names).map_err(|e| anyhow::anyhow!("tls cert: {e}"))?;
         let der = ck.cert.der().clone();
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.signing_key.serialize_der().into());
         let config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![der.clone()], key)
-            .map_err(|e| anyhow!("tls config: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("tls config: {e}"))?;
         use sha2::Digest;
         let fingerprint = sha2::Sha256::digest(der.as_ref()).iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":");
-        Ok(Self { acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)), fingerprint })
+        Ok(Self { acceptor: tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)), fingerprint })
+    }
+
+    #[cfg(not(feature = "web-tls"))]
+    pub fn generate(_host: &str) -> Result<Self> {
+        bail!("this build of commxd has no TLS support, so --web-tls is unavailable")
     }
 }
 
@@ -95,6 +101,7 @@ pub async fn sniff(stream: &TcpStream) -> Sniff {
 /// WebSocket, to be handed to the normal peer code.
 pub async fn serve(stream: TcpStream, kind: Sniff, web: &WebServe) -> Result<Option<tokio::io::DuplexStream>> {
     match (kind, &web.tls) {
+        #[cfg(feature = "web-tls")]
         (Sniff::Tls, Some(tls)) => {
             let s = tokio::time::timeout(HTTP_TIMEOUT, tls.acceptor.accept(stream)).await.context("slow tls")??;
             accept(s, web, true).await

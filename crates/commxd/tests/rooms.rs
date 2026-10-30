@@ -733,6 +733,7 @@ fn password_proof_is_never_sent_to_an_unproven_host() {
 }
 
 #[test]
+#[cfg(feature = "web-tls")]
 fn web_tls_port_still_takes_native_peers_and_redirects_http() {
     let dir = std::env::temp_dir().join(format!("cx-{}-tls-a", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
