@@ -192,7 +192,7 @@ Limits: text is plaintext while it's on screen. Your terminal emulator holds wha
 | password invites | Argon2id (19 MiB, t=2) of the password, salted with room and token. A keyed BLAKE3 proof bound to the Noise handshake hash, sent only after the host signs that same channel. |
 | saved aliases | Argon2id (64 MiB, t=3) → XChaCha20-Poly1305, with authenticated parameters. Files have random names and sit in a private directory. |
 
-See [SECURITY.md](SECURITY.md) for the audit and known limits.
+See [SECURITY.md](SECURITY.md) for the audit and known limits, and [SPEC.md](SPEC.md) for the protocol itself (draft) and its open issues.
 
 ## Develop
 
