@@ -31,8 +31,12 @@ impl Node {
     }
 
     fn spawn_with(dir: PathBuf, extra: &[&str]) -> Self {
+        Self::spawn_at(dir, "127.0.0.1:0", extra)
+    }
+
+    fn spawn_at(dir: PathBuf, listen: &str, extra: &[&str]) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_commxd"))
-            .args(["--data-dir", dir.to_str().unwrap(), "--listen", "127.0.0.1:0", "--no-keep-awake"])
+            .args(["--data-dir", dir.to_str().unwrap(), "--listen", listen, "--no-keep-awake"])
             .args(extra)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -463,6 +467,26 @@ fn voice_uses_udp_fast_path_when_available() {
     b.join(&code);
     wait_link(&mut b, &room, "udp");
     wait_link(&mut a, &room, "udp 1/1");
+    voice_both_ways(&mut a, &mut b, &room);
+}
+
+/// Mesh overlays like Yggdrasil are IPv6-only: invites carry `[addr]:port`.
+#[test]
+fn rooms_work_over_ipv6() {
+    if std::net::TcpListener::bind("[::1]:0").is_err() {
+        eprintln!("no IPv6 loopback here; skipping");
+        return;
+    }
+    let tmp = |tag: &str| std::env::temp_dir().join(format!("cx-{}-{tag}", std::process::id()));
+    let mut a = Node::spawn_at(tmp("v6-a"), "[::1]:0", &[]);
+    let mut b = Node::spawn_at(tmp("v6-b"), "[::1]:0", &[]);
+    a.alias("alice");
+    b.alias("bob");
+    let (room, code) = a.room("mesh", "HostOnly", 15, false);
+    b.join(&code);
+    b.send(&room, "over v6");
+    a.expect_msg("bob", "over v6");
+    wait_link(&mut b, &room, "udp");
     voice_both_ways(&mut a, &mut b, &room);
 }
 

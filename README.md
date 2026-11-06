@@ -87,6 +87,7 @@ Send invite codes over a channel you trust. Each side shows a fingerprint for th
   - **No IP leaks:** peers never see your IP. Clearnet addresses are refused, and the listener binds to loopback only.
   - **Timing:** first bootstrap takes about 15–30s. A new room's onion takes up to a minute before friends can join.
 - **Direct TCP (default).** Port 4700. Use this on a LAN, or over Tailscale/WireGuard with `--advertise 100.x.y.z:4700`, or with a port forward. Peers see each other's IP.
+- **Wi-Fi mesh, no internet.** commx only needs IP between the nodes, so any mesh that provides it works unchanged, e.g. [batman-adv](https://www.open-mesh.org/projects/batman-adv/wiki) or 802.11s on Linux, or [Yggdrasil](https://yggdrasil-network.github.io/) on top of any link. Advertise the mesh address: `commxd --listen '[::]:4700' --advertise '[200:abcd::1]:4700'` (IPv6 addresses go in brackets). Mesh routes blink out for a few seconds when nodes move, so give rooms a longer grace window (`/room new camp --grace 60`) and keep them `host-only`, so a flapping member is removed instead of nuking the room. Each radio hop roughly halves throughput: text and files are fine, voice over more than two or three hops may stutter. Android can't join an ad hoc mesh without root; use a Linux laptop or a travel router as the mesh node.
 
 ## Kill switch
 

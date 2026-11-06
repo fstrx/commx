@@ -641,3 +641,183 @@ decisions.
    doesn't count: it reuses the Rust core.
 4. The formal model of OPEN-10.
 5. An external review.
+
+## 18. Radio profile (draft, not implemented)
+
+A text-only variant for LoRa and similar links: a few kb/s at best, packets
+of about 230 bytes, broadcast, lossy, and limited by law to a small share of
+airtime. Nothing in §7–§13 fits that. A single "hi" costs about 280 bytes
+there, every message crosses the air twice, and heartbeats every 5 s would
+blow the airtime budget many times over. This profile keeps the thesis
+(presence-bound rooms, signed authorship, a host-sequenced chain, nothing
+persisted) and gives up everything but text.
+
+### 18.1 Constraints
+
+Approximate LoRa airtime (125 kHz bandwidth, coding rate 4/5, explicit
+header, CRC on, 8-symbol preamble):
+
+| spreading factor | 40-byte packet | 230-byte packet | full packets/hour at 1% duty cycle |
+|---|---|---|---|
+| SF7 | 0.08 s | 0.36 s | ~100 |
+| SF9 | 0.29 s | 1.15 s | ~30 |
+| SF12 | 2.0 s | 8.2 s | ~4 |
+
+- **Spreading factor.** SF7–SF9 is the practical range for chat. SF12 reaches
+  further but carries about four messages an hour.
+- **Duty cycle.** The 1% limit is the EU 868 MHz rule. Other regions limit
+  airtime differently (for example, dwell time per transmission), so
+  implementations MUST let the operator set an airtime budget and MUST stay
+  under it.
+- **No amateur bands.** Encryption is not allowed there. This profile is
+  only for licence-free ISM bands.
+- **Location.** Radio transmissions can be direction-found. Encryption hides
+  what is said and who said it, not where the transmitter is. Tor-style
+  anonymity is impossible on radio.
+
+### 18.2 Model
+
+- **Joining stays on IP.** Members join with the normal §9 handshake over any
+  IP link: the host's Wi-Fi hotspot, a LAN, or a mesh, usually while the group
+  is together. The room then runs on radio, and losing the IP connection no
+  longer counts as a drop. Joining over the air is out of scope for now.
+- **Broadcast.** Every packet is one broadcast transmission. The author sends
+  a message once, and everyone in range hears it directly. The host does not
+  repeat messages. Instead it periodically broadcasts a small signed `ORDER`
+  packet that sequences what it heard.
+- **Member index.** Each member has a 1-byte index in join order (host = 0,
+  at most 255 members). This replaces 32-byte keys on the air. The index
+  table comes from the IP join (`JoinOk.members` plus later `Join` blocks)
+  and from radio `JOIN` packets (§18.4).
+- **Pairwise keys.** Each member shares a key with the host:
+  `pair_key = BLAKE3_derive_key("commx radio pair v1", X25519(member, host) || room_id)`.
+  It authenticates cheap control packets (beats, repair requests) that only
+  the host needs to check, and carries the new room key during re-keying.
+
+### 18.3 Packet format
+
+```
+radio_key[e] = BLAKE3_derive_key("commx radio key v1", room_key[e])
+hp_key[e]    = BLAKE3_derive_key("commx radio hp v1",  room_key[e])
+tag          = BLAKE3_keyed(radio_key[e], "tag" || BE32(unix_hour))[0..4]
+
+packet = tag(4) || header(12) XOR mask || AEAD(radio_key[e], nonce, body, aad = tag || header)
+header = type(1) || sender(1) || ctr(BE24) || epoch(1, low byte) || seen_seq(BE16) || seen_head(4)
+nonce  = BLAKE3_derive_key("commx radio nonce v1", BE32(epoch) || sender || ctr)[0..24]
+mask   = BLAKE3_keyed(hp_key[e], ciphertext[0..16])[0..12]
+```
+
+- **Fixed overhead:** 32 bytes per packet (4 tag + 12 header + 16 AEAD tag).
+- **Tag.** Lets a receiver drop other rooms' traffic cheaply, and rotates
+  hourly so the room isn't trivially linkable over time. Receivers try the
+  current, previous and next hour.
+- **Header protection.** The header is masked as in QUIC (RFC 9001 §5.4), so
+  outsiders see neither the packet type nor the sender, counter or sizes of
+  fields. A receiver unmasks the header using the first 16 ciphertext bytes,
+  then derives the nonce and opens the body.
+- **Counters.** `ctr` counts every packet a sender transmits, of any type,
+  per epoch. It MUST never repeat, which makes the derived nonce unique.
+  Receivers keep a 64-entry replay window per sender, and
+  `(sender, epoch, ctr)` identifies a packet everywhere (for ordering and
+  repair).
+- **Seen fields.** `seen_seq` and `seen_head` are the sender's latest
+  `ORDER` sequence number and the first 4 bytes of its chain head (§18.5).
+  Every packet thereby reports the sender's view of the chain, which is what
+  detects a host showing different members different chains (OPEN-2).
+
+### 18.4 Packet types
+
+| type | from | body | authenticated by |
+|---|---|---|---|
+| `MSG` (0) | any member | `text || sig(64)` | author signature |
+| `ORDER` (1) | host | `first_seq(BE24) || n(1) || n × (sender(1) || ctr(BE24) || hash(8)) || sig(64)` | host signature |
+| `BEAT` (2) | any member | `mac(8)` | pairwise key (host checks; host's own beats are `ORDER`s) |
+| `REPAIR` (3) | any member | `n(1) || n × (sender(1) || ctr(BE24)) || mac(8)` | pairwise key |
+| `JOIN` (4) | host | `index(1) || sign_pk(32) || dh_pk(32) || name || sig(64)` | host signature |
+| `REMOVE` (5) | host | `index(1) || sig(64)` | host signature |
+| `REKEY` (6) | host | `new_epoch(1) || n × (index(1) || AEAD(pair_key, new_key) (48)) || sig(64)` | host signature |
+| `NUKE` (7) | host | `sig(64)` | host signature |
+
+Signatures go inside the encrypted body, so an outsider who knows a member's
+public key can't test packets against it. Each type signs its own context:
+`"commx-radio-<type>-v1" || room_id || header || body-without-sig`. For
+example, `MSG` signs `"commx-radio-msg-v1" || room_id || header || text`.
+
+**Text.** With a 230-byte radio MTU, a `MSG` carries up to 134 bytes of
+UTF-8 text (230 − 32 − 64). Longer messages are refused; there's no
+fragmentation. Senders SHOULD pad text to a multiple of 16 bytes, so packet
+sizes reveal less about content.
+
+`hash` in an `ORDER` entry is `BLAKE3(packet)[0..8]` of the referenced packet
+as received. `MAC`s are `BLAKE3_keyed(pair_key, header || body-without-mac)[0..8]`.
+
+### 18.5 Ordering and the chain
+
+- **Show on arrival.** Members display a `MSG` as soon as it decrypts and its
+  signature verifies, marked "unconfirmed".
+- **Order in batches.** The host broadcasts an `ORDER` when it has heard
+  messages not yet sequenced, at most once every 30 s, and otherwise as its
+  heartbeat. One host signature covers the whole batch (up to 10 entries
+  per packet).
+- **Chain.** `head_n = BLAKE3("commx-radio-chain-v1" || head_{n-1} || first_seq || entries)`,
+  starting from the head handed over at join. For each `ORDER`, a member
+  checks that it continues its chain and that the host signature is valid,
+  then confirms the listed messages it holds.
+- **Missing pieces aren't attacks.** Radio loses packets, so a missing `ORDER`
+  or a listed message the member never heard is a gap. The member asks for it
+  with `REPAIR` and does not nuke.
+- **Contradictions are.** A member MUST nuke the room when:
+  - a signature fails on a packet that decrypted;
+  - an `ORDER` lists a hash that differs from the packet it holds for that
+    `(sender, ctr)`;
+  - another member's `seen_seq` / `seen_head` contradicts its own chain at
+    that sequence number. That catches equivocation, as soon as the
+    victim's view is reported in any packet.
+- **Repair.**
+  - Any node holding a requested packet MAY rebroadcast it byte for byte,
+    since packets authenticate themselves.
+  - It waits a random 0–10 s first, and skips the rebroadcast if it hears
+    someone else's.
+  - Repairs count against the airtime budget like anything else.
+  - Repair also covers members who can hear the host but not each other.
+- **Silent drops (OPEN-1)** mostly disappear: other members hear a message
+  directly, so a host that never orders it is caught. A `MSG` still
+  unconfirmed after three `ORDER`s is flagged to the user.
+
+### 18.6 Liveness
+
+Grace windows are minutes, not seconds: default 20 minutes, minimum 3
+beat intervals. A member sends a `BEAT` every `grace / 4` unless it sent
+something else in that interval. Any authenticated packet counts as proof
+of life. The kill rules are §12.2's, with "heard from within the grace
+window" as the meaning of "up". When the host removes a member, it sends
+`REMOVE`, then `REKEY`. `REKEY` packets list at most 2 members each, so
+larger rooms need several. Members who miss a `REKEY` ask for it with `REPAIR`.
+
+Rough airtime at SF9 for a member: beats every 5 minutes cost about 3.5 s
+per hour, leaving roughly 28 full messages per hour under a 1% duty cycle.
+The host also spends airtime on `ORDER` packets and repairs, so it SHOULD
+be the node with the best antenna and the most generous budget.
+
+### 18.7 Radio adapters
+
+The profile only needs "broadcast a packet of up to MTU bytes" and "receive
+packets". Planned adapters:
+
+| adapter | hops | notes |
+|---|---|---|
+| RNode / KISS over USB serial | 1 | Raw LoRa: full control of the packet and airtime. First target. |
+| Meshtastic over serial (private app port 256) | multi-hop | The mesh rebroadcasts for range. Meshtastic adds its own header with node ids, which leaks who transmits; its own channel encryption is extra, not relied on. |
+| UDP broadcast with simulated loss | — | For tests: drives the whole profile on one machine. |
+
+### 18.8 Open questions
+
+- **Joining over the air:** a QR-code room card with a single-use token,
+  answered by an over-the-air version of §9.1 split over 3–4 packets.
+- **Bridging:** a room where some members are on IP and others on radio. It
+  needs authors to sign both formats, or a host-signed relay with weaker
+  guarantees.
+- **Compression:** a short-text compressor such as smaz or Unishox, which
+  typically saves 30–50% on short English text.
+- **Forward secrecy:** a hash ratchet per epoch (OPEN-5) costs nothing on the
+  air and should come with this profile from the start.
