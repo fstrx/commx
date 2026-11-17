@@ -64,6 +64,9 @@ pub enum WireMsg {
         /// `invite::password_proof` for this channel.
         proof: [u8; 32],
     },
+    /// Host → members: the room continues on the radio profile (SPEC §18)
+    /// from chain head `head`. Signed with `radio_go_bytes`.
+    RadioGo { room_id: RoomId, head: [u8; 32], grace_secs: u64, sig: Vec<u8> },
 }
 
 pub fn channel_binding(handshake_hash: &[u8], role: &str) -> Vec<u8> {
@@ -77,6 +80,14 @@ pub fn channel_binding(handshake_hash: &[u8], role: &str) -> Vec<u8> {
 pub fn nuke_bytes(room_id: &RoomId) -> Vec<u8> {
     let mut v = b"commx-nuke-v1:".to_vec();
     v.extend_from_slice(room_id);
+    v
+}
+
+pub fn radio_go_bytes(room_id: &RoomId, head: &[u8; 32], grace_secs: u64) -> Vec<u8> {
+    let mut v = b"commx-radio-go-v1:".to_vec();
+    v.extend_from_slice(room_id);
+    v.extend_from_slice(head);
+    v.extend_from_slice(&grace_secs.to_be_bytes());
     v
 }
 

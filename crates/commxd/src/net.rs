@@ -325,6 +325,7 @@ pub async fn join(shared: Shared, transport: Arc<Net>, code: &str, password: Opt
             over_tor: d.net.is_tor(),
             pw_invite: None,
             fault_armed: None,
+            radio: None,
         };
         room.system(
             &ev,

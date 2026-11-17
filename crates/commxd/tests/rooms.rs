@@ -788,3 +788,75 @@ fn web_tls_port_still_takes_native_peers_and_redirects_http() {
     assert!(resp.contains(&format!("Location: https://{addr}/app.js")), "{resp}");
     let _ = std::fs::remove_dir_all(&web);
 }
+
+/// UDP addresses for a simulated radio channel shared by `n` daemons.
+fn radio_specs(n: usize) -> Vec<String> {
+    let socks: Vec<std::net::UdpSocket> = (0..n).map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap()).collect();
+    let addrs: Vec<String> = socks.iter().map(|s| s.local_addr().unwrap().to_string()).collect();
+    (0..n)
+        .map(|i| {
+            let peers: String = addrs.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, a)| format!(",peer={a}")).collect();
+            format!("udp:{}{peers}", addrs[i])
+        })
+        .collect()
+}
+
+/// Join over IP, then `/radio`: text keeps flowing over the (simulated)
+/// air, IP-only features are refused, and the kill switch runs on radio.
+#[test]
+fn room_moves_to_radio_and_keeps_its_kill_switch() {
+    let tmp = |tag: &str| std::env::temp_dir().join(format!("cx-{}-{tag}", std::process::id()));
+    let specs = radio_specs(3);
+    let radio = |i: usize| vec!["--radio", specs[i].as_str(), "--radio-grace", "6", "--radio-budget", "100"];
+    let mut a = Node::spawn_with(tmp("ra-a"), &radio(0));
+    let mut b = Node::spawn_with(tmp("ra-b"), &radio(1));
+    let mut c = Node::spawn_with(tmp("ra-c"), &radio(2));
+    a.alias("alice");
+    b.alias("bob");
+    c.alias("carol");
+    let (room, code) = a.room("field", "HostOnly", 15, false);
+    b.join(&code);
+    let code = a.invite(&room);
+    c.join(&code);
+    a.expect_system("carol joined");
+
+    a.req(json!({"op": "radio", "room_id": room}));
+    for n in [&a, &b, &c] {
+        n.expect_system("room moved to radio");
+    }
+    b.send(&room, "over the air");
+    a.expect_msg("bob", "over the air");
+    c.expect_msg("bob", "over the air");
+    a.send(&room, "loud and clear");
+    b.expect_msg("alice", "loud and clear");
+    c.expect_msg("alice", "loud and clear");
+
+    a.req(json!({"op": "invite", "room_id": room}));
+    let v = a.expect("refusal", 5, |v| v["ev"] == "error");
+    assert!(v["msg"].as_str().unwrap().contains("radio"), "{v}");
+    b.req(json!({"op": "send", "room_id": room, "text": "x".repeat(200)}));
+    let v = b.expect("too long", 5, |v| v["ev"] == "error");
+    assert!(v["msg"].as_str().unwrap().contains("too long for radio"), "{v}");
+
+    // The host's machine dies: no IP, no radio. Members go after the grace window.
+    a.kill();
+    for n in [&b, &c] {
+        let why = n.expect_nuked(&room, 20);
+        assert_eq!(why, "host went silent");
+    }
+}
+
+#[test]
+fn member_without_a_radio_leaves_at_the_handover() {
+    let tmp = |tag: &str| std::env::temp_dir().join(format!("cx-{}-{tag}", std::process::id()));
+    let specs = radio_specs(1);
+    let mut a = Node::spawn_with(tmp("rn-a"), &["--radio", &specs[0], "--radio-grace", "6"]);
+    let mut b = Node::spawn("rn-b");
+    a.alias("alice");
+    b.alias("bob");
+    let (room, code) = a.room("field", "HostOnly", 15, false);
+    b.join(&code);
+    a.req(json!({"op": "radio", "room_id": room}));
+    let why = b.expect_nuked(&room, 10);
+    assert!(why.contains("no radio"), "{why}");
+}

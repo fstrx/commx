@@ -92,6 +92,7 @@ impl Bridge {
             no_udp: opts.no_udp,
             web_dir: None,
             web_tls: false,
+            radio: None,
         };
         let node = rt.spawn(async move {
             let _keep = clients_tx;

@@ -73,6 +73,7 @@ fn request_room(req: &IpcRequest) -> Option<RoomId> {
         | Files { room_id }
         | SaveFile { room_id, .. }
         | Call { room_id }
+        | Radio { room_id }
         | Hangup { room_id }
         | VoiceOut { room_id, .. } => room_id,
         _ => return None,
@@ -342,6 +343,10 @@ async fn handle(
                 Some(_) => room.set_my_presence(&ev, true)?,
                 None => room.start_call(&ev)?,
             }
+        }
+        IpcRequest::Radio { room_id } => {
+            let id = room_arg(&room_id)?;
+            lock(shared).radio_handover(&id)?;
         }
         IpcRequest::Hangup { room_id } => {
             let id = room_arg(&room_id)?;

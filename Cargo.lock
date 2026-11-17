@@ -491,6 +491,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "commx-radio"
+version = "0.4.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "chacha20poly1305",
+ "commx-core",
+ "libc",
+ "rand",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "commx-voice"
 version = "0.4.1"
 dependencies = [
@@ -528,6 +542,7 @@ dependencies = [
  "blake3",
  "clap",
  "commx-core",
+ "commx-radio",
  "data-encoding",
  "hex",
  "libc",

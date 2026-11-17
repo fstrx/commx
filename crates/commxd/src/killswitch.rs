@@ -17,6 +17,7 @@ enum After {
     Nothing,
     Gone(&'static str),
     Nuke(String, bool),
+    Radio([u8; 32], u64, Vec<u8>),
 }
 
 impl Daemon {
@@ -27,6 +28,10 @@ impl Daemon {
         #[cfg(debug_assertions)]
         if room.fault_armed == Some("wire") {
             panic!("injected fault: room wire handling");
+        }
+        // On radio, IP connections are leftovers: nothing they say counts.
+        if room.radio.is_some() {
+            return Followup::default();
         }
         room.touch(kind);
         match msg {
@@ -53,6 +58,9 @@ impl Daemon {
                 Ok(()) => After::Nothing,
                 Err(e) => After::Nuke(format!("integrity failure, host may be compromised: {e}"), true),
             },
+            (PeerKind::Host, WireMsg::RadioGo { room_id: rid, head, grace_secs, sig }) if rid == room_id => {
+                After::Radio(head, grace_secs, sig)
+            }
             (PeerKind::Host, WireMsg::Nuke { room_id: rid, sig }) => {
                 if rid == room_id && verify_nuke(&room.chain.host_pk, &rid, &sig) {
                     After::Nuke("host nuked the room".into(), false)
@@ -66,6 +74,7 @@ impl Daemon {
             After::Nothing => {}
             After::Gone(why) => self.peer_gone(room_id, kind, why),
             After::Nuke(reason, tell) => self.nuke(&room_id, &reason, tell),
+            After::Radio(head, grace, sig) => self.radio_go(&room_id, head, grace, &sig),
         }
         Followup::default()
     }
@@ -94,6 +103,13 @@ impl Daemon {
     pub fn peer_gone(&mut self, room_id: RoomId, kind: PeerKind, why: &str) {
         let ev = self.events.clone();
         let Some(room) = self.rooms.get_mut(&room_id) else { return };
+        if room.radio.is_some() {
+            // Liveness is the radio's business now.
+            if let (Role::Host { peers }, PeerKind::Member(pk)) = (&mut room.role, kind) {
+                peers.remove(&pk);
+            }
+            return;
+        }
         match kind {
             PeerKind::Host => {
                 let reason = format!("host dropped ({why})");
@@ -132,7 +148,10 @@ impl Daemon {
     /// Destroy a room: tell peers if asked, drop every connection, wipe keys,
     /// chain and plaintext from memory.
     pub fn nuke(&mut self, room_id: &RoomId, reason: &str, tell_peers: bool) {
-        let Some(room) = self.rooms.remove(room_id) else { return };
+        let Some(mut room) = self.rooms.remove(room_id) else { return };
+        if let Some(mut r) = room.radio.take() {
+            self.radio_farewell(&mut r, reason, tell_peers);
+        }
         if tell_peers {
             match &room.role {
                 Role::Host { .. } => room.send_all(&WireMsg::Nuke {
@@ -207,6 +226,7 @@ impl Daemon {
             }
         }
 
+        self.radio_tick();
         self.invites.retain(|_, i| i.expires > now);
         // Forget UDP paths whose room or peer is gone.
         let rooms = &self.rooms;
@@ -233,6 +253,10 @@ fn tick_room(room: &mut Room, ev: &Events, now: Instant) -> Vec<(PeerKind, &'sta
     #[cfg(debug_assertions)]
     if room.fault_armed == Some("tick") {
         panic!("injected fault: room tick");
+    }
+    if room.radio.is_some() {
+        // Heartbeats and liveness run inside the radio (`radio_tick`).
+        return Vec::new();
     }
     let grace = Duration::from_secs(room.cfg.grace_secs);
     if now.duration_since(room.last_hb) >= Duration::from_secs(room.cfg.heartbeat_secs()) {

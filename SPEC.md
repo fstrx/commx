@@ -236,6 +236,7 @@ fingerprint is shown next to the invite, to be compared out of band.
 | 11 | `JoinHello` | M→H | `room_id`, `token: [16]` |
 | 12 | `HostProof` | H→M | `host: MemberInfo`, `sig` |
 | 13 | `JoinReqPw` | M→H | `room_id`, `token: [16]`, `member: MemberInfo`, `sig`, `proof: [32]` |
+| 14 | `RadioGo` | H→M | `room_id`, `head: [32]`, `grace_secs: u64`, `sig` (§18.2) |
 
 Signatures (`sig`, `host_sig`) are `Vec<u8>` holding 64 bytes. A node MUST
 ignore messages that make no sense for the peer's role (for example a
@@ -642,7 +643,7 @@ decisions.
 4. The formal model of OPEN-10.
 5. An external review.
 
-## 18. Radio profile (draft, not implemented)
+## 18. Radio profile (draft)
 
 A text-only variant for LoRa and similar links: a few kb/s at best, packets
 of about 230 bytes, broadcast, lossy, and limited by law to a small share of
@@ -651,6 +652,11 @@ there, every message crosses the air twice, and heartbeats every 5 s would
 blow the airtime budget many times over. This profile keeps the thesis
 (presence-bound rooms, signed authorship, a host-sequenced chain, nothing
 persisted) and gives up everything but text.
+
+A prototype lives in `crates/commx-radio` (a sans-IO state machine plus
+link adapters) and is wired into `commxd` behind `--radio`. Its simulation
+tests run the profile at 20% packet loss, with hidden nodes, missed re-keys,
+replayed packets and an equivocating host.
 
 ### 18.1 Constraints
 
@@ -679,16 +685,27 @@ header, CRC on, 8-symbol preamble):
 
 - **Joining stays on IP.** Members join with the normal §9 handshake over any
   IP link: the host's Wi-Fi hotspot, a LAN, or a mesh, usually while the group
-  is together. The room then runs on radio, and losing the IP connection no
-  longer counts as a drop. Joining over the air is out of scope for now.
+  is together. Joining over the air is out of scope for now, and so is
+  joining a room that is already on radio.
+- **Handover.** The host sends every member
+  `RadioGo { room_id, head, grace_secs, sig }` over IP, where `head` is its
+  IP chain head and `sig` signs
+  `"commx-radio-go-v1:" || room_id || head || BE64(grace_secs)`. It then
+  drops its IP peers. A member that verifies the signature MUST check `head`
+  against its own chain head and nuke on mismatch, or nuke if it has no
+  radio. Otherwise it switches over. From then on IP connections are ignored
+  and losing them is not a drop. The radio chain starts from
+  `head_0 = BLAKE3("commx-radio-start-v1" || room_id || head)`. Calls and
+  files end at the handover.
 - **Broadcast.** Every packet is one broadcast transmission. The author sends
   a message once, and everyone in range hears it directly. The host does not
   repeat messages. Instead it periodically broadcasts a small signed `ORDER`
   packet that sequences what it heard.
-- **Member index.** Each member has a 1-byte index in join order (host = 0,
-  at most 255 members). This replaces 32-byte keys on the air. The index
-  table comes from the IP join (`JoinOk.members` plus later `Join` blocks)
-  and from radio `JOIN` packets (§18.4).
+- **Member index.** Each member has a 1-byte index: its position in the
+  room's member list at handover (host = 0, then join order, as built from
+  `JoinOk.members` plus later `Join` and `Leave` blocks, so every member
+  derives the same table). At most 255 members. This replaces 32-byte keys
+  on the air.
 - **Pairwise keys.** Each member shares a key with the host:
   `pair_key = BLAKE3_derive_key("commx radio pair v1", X25519(member, host) || room_id)`.
   It authenticates cheap control packets (beats, repair requests) that only
@@ -730,12 +747,12 @@ mask   = BLAKE3_keyed(hp_key[e], ciphertext[0..16])[0..12]
 | type | from | body | authenticated by |
 |---|---|---|---|
 | `MSG` (0) | any member | `text || sig(64)` | author signature |
-| `ORDER` (1) | host | `first_seq(BE24) || n(1) || n × (sender(1) || ctr(BE24) || hash(8)) || sig(64)` | host signature |
+| `ORDER` (1) | host | `first_seq(BE24) || n(1) || n × (sender(1) || epoch(1) || ctr(BE24) || hash(8)) || sig(64)` | host signature |
 | `BEAT` (2) | any member | `mac(8)` | pairwise key (host checks; host's own beats are `ORDER`s) |
-| `REPAIR` (3) | any member | `n(1) || n × (sender(1) || ctr(BE24)) || mac(8)` | pairwise key |
-| `JOIN` (4) | host | `index(1) || sign_pk(32) || dh_pk(32) || name || sig(64)` | host signature |
+| `REPAIR` (3) | any member | `n(1) || n × (sender(1) || epoch(1) || ctr(BE24)) || mac(8)` | pairwise key |
+| `JOIN` (4) | host | reserved for over-the-air joins (§18.8); ignored | — |
 | `REMOVE` (5) | host | `index(1) || sig(64)` | host signature |
-| `REKEY` (6) | host | `new_epoch(1) || n × (index(1) || AEAD(pair_key, new_key) (48)) || sig(64)` | host signature |
+| `REKEY` (6) | host | `new_epoch(1) || n × (index(1) || AEAD(pair_key, new_key) (48)) || sig(64)`, sealed under the *previous* epoch | host signature |
 | `NUKE` (7) | host | `sig(64)` | host signature |
 
 Signatures go inside the encrypted body, so an outsider who knows a member's
@@ -745,8 +762,20 @@ example, `MSG` signs `"commx-radio-msg-v1" || room_id || header || text`.
 
 **Text.** With a 230-byte radio MTU, a `MSG` carries up to 134 bytes of
 UTF-8 text (230 − 32 − 64). Longer messages are refused; there's no
-fragmentation. Senders SHOULD pad text to a multiple of 16 bytes, so packet
-sizes reveal less about content.
+fragmentation. Senders pad text with zero bytes to a multiple of 16 (at most
+134), so packet sizes reveal less about content; receivers strip trailing
+zeros.
+
+**Sizes.** An `ORDER` entry is 13 bytes, so one `ORDER` sequences up to 10
+messages (32 + 4 + 130 + 64 = 230). A `REPAIR` asks for up to 37 packets.
+A `REKEY` carries 2 members (32 + 1 + 98 + 64 = 195); 3 would not fit.
+Entry `epoch` bytes are the low byte of the epoch, resolved against the
+two epochs a node holds.
+
+**Re-key AEAD.** XChaCha20-Poly1305 under `pair_key`, with
+`nonce = BLAKE3_derive_key("commx radio rekey nonce v1", BE32(new_epoch) || index)[0..24]`
+and `aad = room_id || BE32(new_epoch) || index`. The nonce repeats only when
+the same key is resent to the same member, with the same plaintext.
 
 `hash` in an `ORDER` entry is `BLAKE3(packet)[0..8]` of the referenced packet
 as received. `MAC`s are `BLAKE3_keyed(pair_key, header || body-without-mac)[0..8]`.
@@ -756,13 +785,16 @@ as received. `MAC`s are `BLAKE3_keyed(pair_key, header || body-without-mac)[0..8
 - **Show on arrival.** Members display a `MSG` as soon as it decrypts and its
   signature verifies, marked "unconfirmed".
 - **Order in batches.** The host broadcasts an `ORDER` when it has heard
-  messages not yet sequenced, at most once every 30 s, and otherwise as its
-  heartbeat. One host signature covers the whole batch (up to 10 entries
-  per packet).
-- **Chain.** `head_n = BLAKE3("commx-radio-chain-v1" || head_{n-1} || first_seq || entries)`,
-  starting from the head handed over at join. For each `ORDER`, a member
-  checks that it continues its chain and that the host signature is valid,
-  then confirms the listed messages it holds.
+  messages not yet sequenced, at most once every `min(30 s, grace / 4)`.
+  One host signature covers the whole batch (up to 10 entries per packet).
+  An `ORDER` with `n = 0` is the host's heartbeat: it doesn't extend the
+  chain, and its `first_seq` says where the chain is.
+- **Chain.** `head_n = BLAKE3("commx-radio-chain-v1" || head_{n-1} || BE24(first_seq) || n || entries)`,
+  starting from `head_0` (§18.2). For each `ORDER`, a member checks that it
+  continues its chain and that the host signature is valid, then confirms
+  the listed messages it holds. An `ORDER` that arrives ahead of a gap is
+  held until the gap is filled. Each node keeps the head at every `ORDER`
+  boundary.
 - **Missing pieces aren't attacks.** Radio loses packets, so a missing `ORDER`
   or a listed message the member never heard is a gap. The member asks for it
   with `REPAIR` and does not nuke.
@@ -771,44 +803,81 @@ as received. `MAC`s are `BLAKE3_keyed(pair_key, header || body-without-mac)[0..8
   - an `ORDER` lists a hash that differs from the packet it holds for that
     `(sender, ctr)`;
   - another member's `seen_seq` / `seen_head` contradicts its own chain at
-    that sequence number. That catches equivocation, as soon as the
-    victim's view is reported in any packet.
+    that sequence number, or names a position that isn't an `ORDER`
+    boundary in its chain. That catches equivocation, as soon as the
+    victim's view is reported in any signed packet. Positions ahead of its
+    own are remembered and checked once it gets there;
+  - an `ORDER` covering positions it already has doesn't reproduce the same
+    heads (the host signed two orders for the same place);
+  - (host) a member reports a chain position the host never made.
+
+  Only packets whose sender is authenticated count here: signed packets for
+  everyone, and `BEAT` / `REPAIR` for the host, which can check their MACs.
+  Any room member can still nuke the room this way, as on IP.
 - **Repair.**
+  - A member that is missing listed messages, holds `ORDER`s ahead of a gap,
+    or hears any packet whose `seen_seq` is ahead of its own sends a `REPAIR`
+    at most once per `min(30 s, grace / 4)`. The `REPAIR` lists the missing
+    packets, and its own header's `seen_seq` asks for the `ORDER`s after it.
   - Any node holding a requested packet MAY rebroadcast it byte for byte,
-    since packets authenticate themselves.
-  - It waits a random 0–10 s first, and skips the rebroadcast if it hears
-    someone else's.
+    since packets authenticate themselves. It also rebroadcasts the next 3
+    `ORDER`s after the requester's `seen_seq`.
+  - It waits a random `0 – min(10 s, grace / 8)` first, and skips the
+    rebroadcast if it hears someone else's.
+  - Replay protection doesn't block repairs: a packet older than the replay
+    window is still accepted if it is a listed message the node is missing,
+    or the `ORDER` the chain needs next. Such packets never count as proof
+    of life.
   - Repairs count against the airtime budget like anything else.
   - Repair also covers members who can hear the host but not each other.
+- **Retries.** An author rebroadcasts its own unconfirmed `MSG` after
+  `2 × min(30 s, grace / 4)`, then on a backoff capped at 4 × that, up to 8
+  times. A member holding someone else's unconfirmed `MSG` passes it on
+  (with the repair delay) after two `ORDER`s that don't list it.
 - **Silent drops (OPEN-1)** mostly disappear: other members hear a message
   directly, so a host that never orders it is caught. A `MSG` still
-  unconfirmed after three `ORDER`s is flagged to the user.
+  unconfirmed after three `ORDER`s (or, for the author, three retries) is
+  flagged to the user.
 
 ### 18.6 Liveness
 
-Grace windows are minutes, not seconds: default 20 minutes, minimum 3
-beat intervals. A member sends a `BEAT` every `grace / 4` unless it sent
-something else in that interval. Any authenticated packet counts as proof
-of life. The kill rules are §12.2's, with "heard from within the grace
-window" as the meaning of "up". When the host removes a member, it sends
-`REMOVE`, then `REKEY`. `REKEY` packets list at most 2 members each, so
-larger rooms need several. Members who miss a `REKEY` ask for it with `REPAIR`.
+Grace windows are minutes, not seconds: default 20 minutes (`--radio-grace`).
+A member sends a `BEAT` every `grace / 6` unless it sent a packet of its own
+in that interval (rebroadcasts don't count: they prove nothing about the
+sender). Six beats per window keep a live member in the room at 30% packet
+loss with probability 1 − 0.3⁶ ≈ 99.93% per window. The host's heartbeat is
+an empty `ORDER` on the same schedule. Any fresh authenticated packet counts
+as proof of life; replayed ones don't. The kill rules are §12.2's, with
+"heard from within the grace window" as the meaning of "up". Members only
+watch the host; the host watches everyone.
 
-Rough airtime at SF9 for a member: beats every 5 minutes cost about 3.5 s
-per hour, leaving roughly 28 full messages per hour under a 1% duty cycle.
+When the host removes a member, it sends `REMOVE`, then the `REKEY`s
+(sealed under the old epoch), and switches to the new epoch after the last
+one. A member that missed its `REKEY` keeps talking under the old epoch;
+the host still holds that epoch's key for receiving, notices, and resends
+that member's `REKEY` (at most once per `min(30 s, grace / 4)`). Nodes keep
+two epochs' keys. One removal is in flight at a time.
+
+The host's `NUKE` is sent twice, outside the airtime budget: it is the last
+thing the room ever sends.
+
+Rough airtime at SF9 for a member: beats every 3⅓ minutes cost about 5 s
+per hour, leaving roughly 27 full messages per hour under a 1% duty cycle.
 The host also spends airtime on `ORDER` packets and repairs, so it SHOULD
-be the node with the best antenna and the most generous budget.
+be the node with the best antenna and the most generous budget. Nodes keep
+a sliding one-hour window of airtime used and never exceed their budget
+(`--radio-budget`, percent).
 
 ### 18.7 Radio adapters
 
 The profile only needs "broadcast a packet of up to MTU bytes" and "receive
 packets". Planned adapters:
 
-| adapter | hops | notes |
-|---|---|---|
-| RNode / KISS over USB serial | 1 | Raw LoRa: full control of the packet and airtime. First target. |
-| Meshtastic over serial (private app port 256) | multi-hop | The mesh rebroadcasts for range. Meshtastic adds its own header with node ids, which leaks who transmits; its own channel encryption is extra, not relied on. |
-| UDP broadcast with simulated loss | — | For tests: drives the whole profile on one machine. |
+| adapter | hops | status | notes |
+|---|---|---|---|
+| RNode / KISS over USB serial (`rnode:`) | 1 | implemented, not yet tested on hardware | Raw LoRa: full control of the packet and airtime. The host sets frequency, bandwidth, SF, CR and TX power over KISS, then sends `CMD_DATA` frames. Unix only for now. |
+| UDP to fixed peers with simulated loss (`udp:`) | — | implemented | Drives the whole profile on one machine. |
+| Meshtastic over serial (private app port 256) | multi-hop | planned | The mesh rebroadcasts for range. Meshtastic adds its own header with node ids, which leaks who transmits; its own channel encryption is extra, not relied on. |
 
 ### 18.8 Open questions
 

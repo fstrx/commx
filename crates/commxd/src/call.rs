@@ -104,6 +104,9 @@ impl Room {
     }
 
     pub fn start_call(&mut self, ev: &Events) -> Result<()> {
+        if self.radio.is_some() {
+            bail!("radio rooms carry text only");
+        }
         if self.call.is_some() {
             bail!("a call is already running here");
         }

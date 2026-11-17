@@ -281,6 +281,8 @@ pub struct Room {
     /// Test-only fault injection point ("wire" / "tick"); inert in release builds.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub fault_armed: Option<&'static str>,
+    /// Set once the room has moved to the radio link; IP is ignored from then on.
+    pub radio: Option<commx_radio::Radio>,
 }
 
 /// Work the connection task does after releasing the lock.
@@ -309,6 +311,7 @@ impl Room {
             host_fp: self.host.id.fingerprint(),
             members: self.members.iter().map(|m| m.name.clone()).collect(),
             link: match &self.role {
+                _ if self.radio.is_some() => "radio".into(),
                 _ if self.over_tor => "tor".into(),
                 Role::Member { host } => host.link().to_string(),
                 Role::Host { peers } => {
@@ -323,7 +326,7 @@ impl Room {
         self.members.iter().find(|m| &m.id.sign_pk == pk).map(|m| m.name.clone())
     }
 
-    fn push(&mut self, ev: &Events, line: ChatLine) {
+    pub(crate) fn push(&mut self, ev: &Events, line: ChatLine) {
         self.lines.push(&line);
         ev.send(IpcEvent::Line { room_id: room_id_hex(&self.id), line });
     }
@@ -518,6 +521,9 @@ impl Room {
         file_id: [u8; 16],
         meta: &FileMeta,
     ) -> Result<Vec<mpsc::Sender<WireMsg>>> {
+        if self.radio.is_some() {
+            bail!("radio rooms carry text only");
+        }
         let key = self.keys.get(&self.epoch).ok_or_else(|| anyhow!("no room key"))?;
         let me_pk = self.me.public().sign_pk;
         let plain = Zeroizing::new(postcard::to_allocvec(meta)?);
@@ -574,6 +580,10 @@ impl Room {
         if text.trim().is_empty() {
             bail!("empty message");
         }
+        // Shown once it's on the air.
+        if let Some(r) = &mut self.radio {
+            return r.send_text(text);
+        }
         if text.len() > MAX_TEXT_LEN {
             bail!("message too long (max {MAX_TEXT_LEN} bytes)");
         }
@@ -606,6 +616,8 @@ pub struct Daemon {
     pub udp_out: Option<Outbox>,
     /// Browser client enabled (`--web`): invites also get a web link.
     pub web: Option<WebInfo>,
+    /// Radio link (`--radio`), for rooms moved off IP.
+    pub radio: Option<crate::radio::RadioHw>,
     /// Test-only fault injection ("tick-task"); inert in release builds.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub fault: Option<String>,
@@ -625,6 +637,7 @@ impl Daemon {
             udp_index: HashMap::new(),
             udp_out: None,
             web: None,
+            radio: None,
             fault: None,
             events: Events::new(),
             power: Power::new(keep_awake),
@@ -728,6 +741,7 @@ impl Daemon {
             over_tor: self.net.is_tor(),
             pw_invite: None,
             fault_armed: None,
+            radio: None,
         };
         room.keys.insert(0, RoomKey::generate());
         let ev = self.events.clone();
@@ -751,6 +765,9 @@ impl Daemon {
         let Role::Host { peers } = &room.role else {
             bail!("only the room host can invite");
         };
+        if room.radio.is_some() {
+            bail!("radio rooms can't take new members");
+        }
         if room.cfg.is_dm && !peers.is_empty() {
             bail!("DM is full");
         }
@@ -769,6 +786,9 @@ impl Daemon {
         }
         if room.cfg.is_dm {
             bail!("DMs only take single-use invites");
+        }
+        if room.radio.is_some() {
+            bail!("radio rooms can't take new members");
         }
         Ok(())
     }
@@ -873,6 +893,9 @@ impl Daemon {
         let Role::Host { peers } = &room.role else {
             return deny("not hosted here");
         };
+        if room.radio.is_some() {
+            return deny("the room has moved to radio");
+        }
         if room.cfg.is_dm && !peers.is_empty() {
             return deny("DM is full");
         }

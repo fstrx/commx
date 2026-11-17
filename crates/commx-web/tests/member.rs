@@ -34,6 +34,7 @@ impl Host {
             no_udp: true,
             web_dir: None,
             web_tls: false,
+            radio: None,
         };
         tokio::spawn(async move {
             let _keep = clients_tx;

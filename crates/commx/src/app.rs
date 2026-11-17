@@ -488,6 +488,10 @@ impl App {
                 Some(room_id) => vec![IpcRequest::Files { room_id }],
                 None => need_room(self),
             },
+            Command::Radio => match room {
+                Some(room_id) => vec![IpcRequest::Radio { room_id }],
+                None => need_room(self),
+            },
             Command::Save { no, dest } => match room {
                 Some(room_id) => {
                     let dest = dest.map(|d| expand_path(&d)).unwrap_or_else(default_download_dir);

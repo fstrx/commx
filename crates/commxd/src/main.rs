@@ -48,6 +48,18 @@ struct Args {
     /// Don't use the UDP voice fast path (e.g. UDP is blocked); calls use TCP.
     #[arg(long)]
     no_udp: bool,
+    /// Radio link that rooms can move onto with /radio (text only), e.g.
+    /// `rnode:/dev/ttyACM0,freq=869525000,sf=9` or, to simulate one,
+    /// `udp:127.0.0.1:4801,peer=127.0.0.1:4802,loss=0.1`.
+    #[arg(long)]
+    radio: Option<String>,
+    /// Share of airtime the radio may use, in percent. The EU 868 MHz rule is 1;
+    /// check your region's.
+    #[arg(long, default_value_t = 1.0, requires = "radio")]
+    radio_budget: f64,
+    /// Kill-switch grace window for rooms on the radio, in seconds.
+    #[arg(long, default_value_t = 1200, requires = "radio")]
+    radio_grace: u64,
     /// Windows: relaunch in the background with no console window.
     #[cfg(windows)]
     #[arg(long)]
@@ -116,6 +128,11 @@ async fn main() -> Result<()> {
         no_udp: args.no_udp,
         web_dir: args.web,
         web_tls: args.web_tls,
+        radio: args.radio.map(|link| commxd::RadioOpts {
+            link,
+            budget_pct: args.radio_budget,
+            grace_secs: args.radio_grace,
+        }),
     };
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {

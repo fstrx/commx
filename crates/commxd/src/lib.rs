@@ -10,6 +10,7 @@ mod ipc_server;
 mod killswitch;
 mod net;
 mod power;
+mod radio;
 mod state;
 mod supervise;
 mod transport;
@@ -17,6 +18,7 @@ mod udp;
 mod web;
 
 pub use commx_core::local_ipc::{Reader, Writer};
+pub use radio::RadioOpts;
 pub use supervise::install_panic_hook;
 
 use anyhow::{Context, Result};
@@ -54,6 +56,8 @@ pub struct Config {
     /// Serve the browser client over HTTPS (self-signed, per run). Browsers
     /// only allow the microphone in a secure context.
     pub web_tls: bool,
+    /// A radio link that rooms can move onto with `/radio` (SPEC §18).
+    pub radio: Option<RadioOpts>,
 }
 
 /// How UI clients reach the daemon.
@@ -145,6 +149,10 @@ pub async fn run(cfg: Config, control: Control, shutdown: impl Future<Output = (
             Ok(sock) => lock(&shared).udp_out = Some(udp::start(shared.clone(), sock)),
             Err(e) => eprintln!("udp {bound} unavailable ({e}); voice will use tcp"),
         }
+    }
+    if let Some(opts) = &cfg.radio {
+        let label = radio::start(shared.clone(), opts).await.context("--radio")?;
+        eprintln!("radio: {label}");
     }
     eprintln!("commxd up: {}", transport.label());
 
