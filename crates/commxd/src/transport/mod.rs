@@ -7,7 +7,9 @@
 pub mod tor;
 
 use anyhow::{anyhow, bail, Context, Result};
-use commx_core::wire::{self, WireMsg};
+use commx_core::secmem::Locked;
+use commx_core::wire::{self, WireMsg, HANDSHAKE_SECRET_LEN, NOISE_PROLOGUE, REKEY_EVERY};
+use rand::{rngs::OsRng, RngCore};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -227,10 +229,19 @@ pub struct Conn {
     pub reader: SecureReader,
     pub writer: SecureWriter,
     /// Unique per channel; aliases sign it to prove who's on the other end.
+    /// Public: anyone who saw the handshake can compute it.
     pub handshake_hash: Vec<u8>,
+    /// Known only to the two ends (see `wire::channel_secret`).
+    pub secret: Locked<32>,
 }
 
-type Noise = Arc<snow::StatelessTransportState>;
+/// Both halves of a connection share the cipher states; each re-keys only
+/// its own direction.
+type Noise = Arc<std::sync::Mutex<snow::StatelessTransportState>>;
+
+fn noise(n: &Noise) -> std::sync::MutexGuard<'_, snow::StatelessTransportState> {
+    n.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 pub struct SecureReader {
     io: ReadHalf<Box<dyn Stream>>,
@@ -262,31 +273,46 @@ async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> Result<(
 }
 
 pub async fn handshake(stream: Box<dyn Stream>, key: &NodeKey, initiator: bool) -> Result<Conn> {
-    let builder = snow::Builder::new(NOISE_PARAMS.parse()?).local_private_key(&key.private);
+    let builder =
+        snow::Builder::new(NOISE_PARAMS.parse()?).prologue(NOISE_PROLOGUE).local_private_key(&key.private);
     let mut hs = if initiator { builder.build_initiator()? } else { builder.build_responder()? };
     let (mut r, mut w) = tokio::io::split(stream);
-    let mut buf = vec![0u8; MAX_NOISE_MSG];
+    let mut buf = Zeroizing::new(vec![0u8; MAX_NOISE_MSG]);
+    let mut mine = Zeroizing::new([0u8; HANDSHAKE_SECRET_LEN]);
+    OsRng.fill_bytes(&mut mine[..]);
+    let mut theirs = Zeroizing::new([0u8; HANDSHAKE_SECRET_LEN]);
 
     // XX: -> e ; <- e, ee, s, es ; -> s, se
+    // Messages 2 and 3 are encrypted (forward-secret) and each carries 32
+    // random bytes from its sender; message 1 is cleartext and empty.
     for step in 0..3 {
         let we_send = (step % 2 == 0) == initiator;
         if we_send {
-            let n = hs.write_message(&[], &mut buf)?;
+            let payload: &[u8] = if step == 0 { &[] } else { &mine[..] };
+            let n = hs.write_message(payload, &mut buf)?;
             write_frame(&mut w, &buf[..n]).await?;
         } else {
             let msg = read_frame(&mut r).await?;
-            hs.read_message(&msg, &mut buf)?;
+            let n = hs.read_message(&msg, &mut buf)?;
+            match (step, n) {
+                (0, 0) => {}
+                (1 | 2, HANDSHAKE_SECRET_LEN) => theirs.copy_from_slice(&buf[..n]),
+                _ => bail!("unexpected handshake payload (peer runs another commx version?)"),
+            }
         }
     }
     if !hs.is_handshake_finished() {
         bail!("noise handshake incomplete");
     }
     let handshake_hash = hs.get_handshake_hash().to_vec();
-    let noise: Noise = Arc::new(hs.into_stateless_transport_mode()?);
+    let (resp, init) = if initiator { (&theirs, &mine) } else { (&mine, &theirs) };
+    let secret = Locked::from_bytes(&Zeroizing::new(wire::channel_secret(&handshake_hash, &resp[..], &init[..])));
+    let noise: Noise = Arc::new(std::sync::Mutex::new(hs.into_stateless_transport_mode()?));
     Ok(Conn {
         reader: SecureReader { io: r, noise: noise.clone(), nonce: 0 },
         writer: SecureWriter { io: w, noise, nonce: 0 },
         handshake_hash,
+        secret,
     })
 }
 
@@ -298,8 +324,15 @@ impl SecureWriter {
         }
         wire::pad(&mut plain, MAX_NOISE_MSG - TAG_LEN);
         let mut out = vec![0u8; plain.len() + TAG_LEN];
-        let n = self.noise.write_message(self.nonce, &plain, &mut out)?;
-        self.nonce += 1;
+        let n = {
+            let mut nz = noise(&self.noise);
+            let n = nz.write_message(self.nonce, &plain, &mut out)?;
+            self.nonce += 1;
+            if self.nonce.is_multiple_of(REKEY_EVERY) {
+                nz.rekey_outgoing();
+            }
+            n
+        };
         write_frame(&mut self.io, &out[..n]).await
     }
 }
@@ -308,8 +341,73 @@ impl SecureReader {
     pub async fn recv(&mut self) -> Result<WireMsg> {
         let frame = read_frame(&mut self.io).await?;
         let mut plain = Zeroizing::new(vec![0u8; frame.len()]);
-        let n = self.noise.read_message(self.nonce, &frame, &mut plain)?;
-        self.nonce += 1;
+        let n = {
+            let mut nz = noise(&self.noise);
+            let n = nz.read_message(self.nonce, &frame, &mut plain)?;
+            self.nonce += 1;
+            if self.nonce.is_multiple_of(REKEY_EVERY) {
+                nz.rekey_incoming();
+            }
+            n
+        };
         wire::decode(&plain[..n])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn pair() -> (Conn, Conn) {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (ka, kb) = (NodeKey::generate().unwrap(), NodeKey::generate().unwrap());
+        let (x, y) = tokio::join!(handshake(Box::new(a), &ka, true), handshake(Box::new(b), &kb, false));
+        (x.unwrap(), y.unwrap())
+    }
+
+    #[tokio::test]
+    async fn channel_secret_is_shared_and_not_the_public_hash() {
+        let (a, b) = pair().await;
+        assert_eq!(a.handshake_hash, b.handshake_hash);
+        assert_eq!(a.secret.bytes(), b.secret.bytes());
+        assert_ne!(&a.secret.bytes()[..], &a.handshake_hash[..32]);
+        let (c, _) = pair().await;
+        assert_ne!(a.secret.bytes(), c.secret.bytes());
+    }
+
+    #[tokio::test]
+    async fn rekeying_keeps_long_sessions_in_step() {
+        let (mut a, mut b) = pair().await;
+        for i in 0..(3 * REKEY_EVERY + 5) {
+            a.writer.send(&WireMsg::JoinDenied { reason: format!("a{i}") }).await.unwrap();
+            b.writer.send(&WireMsg::Heartbeat).await.unwrap();
+            match b.reader.recv().await.unwrap() {
+                WireMsg::JoinDenied { reason } => assert_eq!(reason, format!("a{i}")),
+                _ => panic!(),
+            }
+            assert!(matches!(a.reader.recv().await.unwrap(), WireMsg::Heartbeat));
+        }
+    }
+
+    #[tokio::test]
+    async fn other_protocol_versions_fail_the_handshake() {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (ka, kb) = (NodeKey::generate().unwrap(), NodeKey::generate().unwrap());
+        // An old peer: no prologue, empty payloads.
+        let old = async move {
+            let mut hs = snow::Builder::new(NOISE_PARAMS.parse().unwrap())
+                .local_private_key(&ka.private)
+                .build_initiator()
+                .unwrap();
+            let (mut r, mut w) = tokio::io::split(a);
+            let mut buf = vec![0u8; MAX_NOISE_MSG];
+            let n = hs.write_message(&[], &mut buf).unwrap();
+            write_frame(&mut w, &buf[..n]).await.unwrap();
+            let msg = read_frame(&mut r).await.unwrap();
+            hs.read_message(&msg, &mut buf).is_err()
+        };
+        let (old_failed, new) = tokio::join!(old, handshake(Box::new(b), &kb, false));
+        assert!(old_failed);
+        assert!(new.is_err());
     }
 }

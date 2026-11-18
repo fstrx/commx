@@ -56,6 +56,9 @@ impl Transport {
         let mut out = vec![0u8; plain.len() + TAG];
         let n = self.noise.write_message(self.tx_nonce, &plain, &mut out)?;
         self.tx_nonce += 1;
+        if self.tx_nonce.is_multiple_of(wire::REKEY_EVERY) {
+            self.noise.rekey_outgoing();
+        }
         Ok(frame(&out[..n]))
     }
 
@@ -63,6 +66,9 @@ impl Transport {
         let mut plain = Zeroizing::new(vec![0u8; f.len()]);
         let n = self.noise.read_message(self.rx_nonce, f, &mut plain)?;
         self.rx_nonce += 1;
+        if self.rx_nonce.is_multiple_of(wire::REKEY_EVERY) {
+            self.noise.rekey_incoming();
+        }
         wire::decode(&plain[..n])
     }
 }
@@ -125,7 +131,7 @@ impl Member {
         let params: snow::params::NoiseParams = NOISE_PARAMS.parse()?;
         let kp = snow::Builder::new(params.clone()).generate_keypair()?;
         let private = Zeroizing::new(kp.private);
-        let mut hs = snow::Builder::new(params).local_private_key(&private).build_initiator()?;
+        let mut hs = snow::Builder::new(params).prologue(wire::NOISE_PROLOGUE).local_private_key(&private).build_initiator()?;
         let mut buf = vec![0u8; MAX_FRAME];
         let n = hs.write_message(&[], &mut buf)?;
         let mut m = Self {
@@ -265,9 +271,16 @@ impl Member {
     fn on_frame(&mut self, f: &[u8]) -> Result<()> {
         match std::mem::replace(&mut self.stage, Stage::Dead) {
             Stage::Handshake(mut hs) => {
-                let mut buf = vec![0u8; MAX_FRAME];
-                hs.read_message(f, &mut buf).context("handshake")?;
-                let n = hs.write_message(&[], &mut buf)?;
+                let mut buf = Zeroizing::new(vec![0u8; MAX_FRAME]);
+                let got = hs.read_message(f, &mut buf).context("handshake")?;
+                if got != wire::HANDSHAKE_SECRET_LEN {
+                    bail!("unexpected handshake payload (host runs another commx version?)");
+                }
+                // The browser never uses the channel secret (no UDP), but
+                // the handshake is the same for every peer.
+                let mut mine = Zeroizing::new([0u8; wire::HANDSHAKE_SECRET_LEN]);
+                OsRng.fill_bytes(&mut mine[..]);
+                let n = hs.write_message(&mine[..], &mut buf)?;
                 self.out.extend(frame(&buf[..n]));
                 let hash = hs.get_handshake_hash().to_vec();
                 let noise = hs.into_stateless_transport_mode()?;

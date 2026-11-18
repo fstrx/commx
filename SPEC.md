@@ -160,14 +160,33 @@ A connection is a reliable byte stream (TCP, a Tor stream, or a WebSocket,
 frame = BE32(len) || bytes      ; len ≤ 65535
 ```
 
-The dialer is the Noise initiator. The handshake is `XX` with empty payloads
-and no prologue (OPEN-8), using each side's node key as static key:
+The dialer is the Noise initiator. The handshake is `XX` with prologue
+`"commx-noise-v2"`, using each side's node key as static key:
 
 ```
--> e
-<- e, ee, s, es
--> s, se
+-> e                      ; payload empty
+<- e, ee, s, es           ; payload r_resp (32 random bytes)
+-> s, se                  ; payload r_init (32 random bytes)
 ```
+
+A different prologue (an older or newer channel version) fails the handshake
+outright, so mismatched peers never get a half-working connection. Any other
+payload length aborts too. Messages 2 and 3 are encrypted, so `r_resp` and
+`r_init` are known only to the two ends:
+
+```
+channel_secret = BLAKE3_derive_key("commx channel secret v2", h || r_resp || r_init)
+```
+
+The handshake hash `h` is **not** secret: anyone who records the handshake
+can recompute it. It serves only as channel binding (below). Keys outside
+Noise (the UDP path, §13.4) come from `channel_secret`.
+
+**Re-keying.** Each direction calls Noise `REKEY` (Noise spec §11.3) on its
+cipher after every 64 frames: after the frame with nonce 63, 127, and so on.
+Both ends count frames, so no signalling is needed. A cipher key taken from
+a running node opens at most the last 64 frames in that direction; with
+heartbeats every ≤5 s, an idle link re-keys at least every ~5 minutes.
 
 After the handshake, each frame carries one Noise transport message. Its
 plaintext is `postcard(WireMsg)` (§8), followed by zero padding. The Noise
@@ -554,14 +573,25 @@ Voice.ct = XChaCha20-Poly1305(call_key, nonce, plain, aad)
 ### 13.4 UDP fast path (optional)
 
 In direct (non-Tor) mode, each room connection also gets a UDP path to the
-host's TCP port, keyed from the handshake hash:
+host's TCP port, keyed from the channel secret (§7.1), with one key chain per
+direction:
 
 ```
-udp_key = BLAKE3_derive_key("commx udp key v1", h)
-path_id = BLAKE3_derive_key("commx udp id v1", h)[0..8]
-datagram = path_id || nonce(24) || XChaCha20-Poly1305(udp_key, nonce, postcard(UdpMsg), aad = path_id)
-UdpMsg = Ping (0) | Pong (1) | Voice(WireMsg::Voice) (2)        ; datagram ≤ 1200 bytes
+path_id   = BLAKE3_derive_key("commx udp id v2",  channel_secret)[0..8]
+K_i2r[0]  = BLAKE3_derive_key("commx udp i2r v2", channel_secret)   ; member → host
+K_r2i[0]  = BLAKE3_derive_key("commx udp r2i v2", channel_secret)   ; host → member
+K[n+1]    = BLAKE3_derive_key("commx udp ratchet v2", K[n])
+datagram  = path_id || BE32(n) || nonce(24) || XChaCha20-Poly1305(K[n], nonce, postcard(UdpMsg), aad = path_id || BE32(n))
+UdpMsg    = Ping (0) | Pong (1) | Voice(WireMsg::Voice) (2)        ; datagram ≤ 1200 bytes
 ```
+
+- **Ratchet.** A sender moves to `K[n+1]` after 512 datagrams or 30 s and
+  erases `K[n]`. A receiver keeps its current and previous key, follows a
+  sender forward by at most 64 steps, and commits the new keys only after a
+  datagram under them authenticates. A key taken from a running node opens at
+  most about a minute of recorded datagrams.
+- **Version 1** keyed this layer from `h`, which an eavesdropper on the TCP
+  handshake could recompute (SECURITY.md, M7).
 
 - The member pings every second. The host learns the member's address only
   from authenticated pings and answers with a pong.
@@ -634,7 +664,7 @@ decisions.
 | OPEN-5 | **No forward secrecy within an epoch.** | A hash ratchet: `room_key[e, n+1] = BLAKE3_derive_key("commx ratchet v1", room_key[e, n])`, stepped every N blocks or M minutes, with the step index in `Payload`. Longer term, MLS (RFC 9420) for group keys, which also gives post-compromise security. |
 | OPEN-6 | **Sealed boxes aren't bound to context.** | AAD = `"commx-sealed-v2" || room_id || BE32(epoch) || purpose`. |
 | OPEN-7 | **Late joiners miss running calls.** | When a member joins mid-call, the host (or the call's starter) seals `CallMeta` to the joiner in a `CallSync` message. |
-| OPEN-8 | **No versioning.** Nothing in the handshake says which protocol version either side speaks. | Noise prologue `"commx/<major>"` (a mismatch fails the handshake cleanly), plus a `Hello { version, features }` as the first transport message. Invite prefixes already carry a format version. |
+| OPEN-8 | **Coarse versioning.** The Noise prologue (`"commx-noise-v2"`) makes mismatched channel versions fail the handshake cleanly, but there's no feature negotiation within a version. | A `Hello { version, features }` as the first transport message. Invite prefixes already carry a format version. |
 | OPEN-9 | **Rust-shaped encoding.** | Byte-level layouts in this document plus test vectors (§17). Consider a tagged, length-delimited format if a second implementation finds postcard painful. |
 | OPEN-10 | **No formal analysis.** | Model the join (§9.1 and §9.2) and chain rules in Tamarin or ProVerif: host authentication, proof secrecy against a MITM, injective agreement on blocks. |
 | OPEN-11 | **Host-chosen timestamps.** `ts_min` is author-chosen and unchecked. | Members flag entries more than a few minutes off their own clock. |

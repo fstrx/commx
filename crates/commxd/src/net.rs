@@ -180,7 +180,7 @@ pub async fn handle_inbound(
     let sign_pk = member.id.sign_pk;
     let res = {
         let mut d = lock(&shared);
-        let udp = d.udp_out.clone().map(|out| UdpPath::new(&conn.handshake_hash, None, out));
+        let udp = d.udp_out.clone().map(|out| UdpPath::new(conn.secret.bytes(), false, None, out));
         let udp_id = udp.as_ref().map(|u| u.id);
         let peer = Peer::new(lanes, cancel_tx, udp);
         let res = match contain(|| d.admit(room_id, auth, member, &sig, &conn.handshake_hash, peer)) {
@@ -312,7 +312,7 @@ pub async fn join(shared: Shared, transport: Arc<Net>, code: &str, password: Opt
                 host: Peer::new(
                     lanes,
                     cancel_tx,
-                    d.udp_out.clone().map(|out| UdpPath::new(&conn.handshake_hash, host_udp, out)),
+                    d.udp_out.clone().map(|out| UdpPath::new(conn.secret.bytes(), true, host_udp, out)),
                 ),
             },
             last_hb: Instant::now(),

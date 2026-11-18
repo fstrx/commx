@@ -6,6 +6,7 @@ commx is unaudited by third parties. This file records the internal review and t
 
 **In scope:**
 - **Network observers.** They can't see content, and frames are padded to a few sizes so message lengths don't show. With Tor they can't see who talks to whom. Timing and volume still show.
+- **Someone who records traffic and later seizes a running node.** Channel keys re-key every 64 frames and UDP and radio keys ratchet forward, so recorded traffic older than a few minutes (an hour or so on radio) stays sealed. Messages still on the node's screen are, of course, exposed.
 - **Non-member peers.** They can't join without an invite and can't read or inject anything.
 - **A malicious member.** They can't forge others' messages, can't make the host accept undecryptable data, and can't flood the room.
 - **A malicious host.** The host can't forge, reorder or drop messages without members detecting it and nuking the room.
@@ -51,6 +52,17 @@ This covers everything since the first audit: memory hardening, Tor, files, Wind
 | H3 | high | **Path traversal on `/save`.** A malicious room member could announce a file named e.g. `../.ssh/authorized_keys` or `../Library/LaunchAgents/x.plist`. Receivers only stripped control characters, and `/save` joined the name onto Downloads, so the victim's daemon would create attacker-controlled files anywhere the user could write. That's persistence or code execution. | Received names are reduced to one safe path component at the trust boundary. Separators from every OS are handled; dot files, reserved names and over-long names are defused. `/save` independently refuses any path not directly inside the chosen directory, and opens with `O_NOFOLLOW`. An end-to-end test plays the malicious sender, and it fails on the old code. |
 | M6 | medium | **DNS leak in Tor mode.** Joining a room always ran a system DNS lookup on the invite address, meant for the UDP fast path that Tor mode doesn't use. On Linux/glibc and Windows that sends a cleartext query for the room's `.onion` to the resolver. Observers could then see which IPs join the same room. | The lookup now runs only when the UDP path is on. `.onion` names are never handed to the system resolver in any mode. |
 
+## Internal audit #3 (November 2026, v0.5.0 → v0.6.0)
+
+Reviewing what a captured packet, or a node seized mid-session, gives away. **M7 affects every version up to v0.5.0. v0.6.0 changes the channel protocol, so every node in a room must upgrade together.**
+
+| id | severity | finding | fix |
+|---|---|---|---|
+| M7 | medium | **UDP path keys were computable by an eavesdropper.** The UDP voice path was keyed from the Noise handshake hash, which isn't secret: anyone who recorded the TCP handshake (someone on the same Wi-Fi, mesh or ISP path) could derive it. Audio stayed sealed under the call key, but they could read each datagram's room id, call id and speaker key, and forge authenticated pings. A forged ping set the host's idea of the member's UDP address, which blackholed that member's voice and let pongs be reflected at third parties. Tor mode never had UDP and wasn't affected. | Each side now puts 32 random bytes in its encrypted handshake payload. The UDP path is keyed from a secret derived from both, which never appears on the wire. |
+| L1 | low | **No forward secrecy inside a session.** A Noise session kept one cipher key per direction for as long as the connection lived, and the UDP key never changed, so memory taken from a running node opened every recorded frame of its current sessions. | Noise re-keys each direction every 64 frames (≤ ~5 min idle). UDP keys ratchet every 512 datagrams or 30 s, and old keys are erased. |
+
+Also new in this round: every frame is padded to a few fixed sizes (README → Network), and the radio profile gained hourly key ratchets and fixed packet sizes.
+
 ## Fault containment
 
 A daemon crash is a denial of service against every room on that node, since the kill switch nukes them all. So the daemon treats "a peer can crash me" as a security bug:
@@ -92,7 +104,7 @@ A daemon crash is a denial of service against every room on that node, since the
 - **No reconnect.** A real disconnect is a drop, by design.
 - **Voice frames aren't signed per sender.** They're authenticated as "someone holding the call key". A malicious participant, or the host, could inject audio attributed to someone else. Chat messages and files *are* signed. Per-frame signatures would roughly double call bandwidth.
 - **UDP fast path (direct mode only).**
-  - Each connection's UDP datagrams are encrypted and authenticated with a key derived from its Noise handshake hash.
+  - Each connection's UDP datagrams are encrypted and authenticated with per-direction keys derived from a secret only the two ends hold, ratcheted forward every 30 s (see M7).
   - Unauthenticated datagrams get no reply, and ping and pong are the same size, so the socket can't be used for amplification or aimed at third parties.
   - The host learns a member's UDP address only from that member's authenticated pings.
   - UDP is never used in Tor mode.

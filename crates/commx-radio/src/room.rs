@@ -790,7 +790,9 @@ impl Radio {
     }
 
     fn parse_entries(&self, raw: &[u8]) -> Vec<Entry> {
-        raw.chunks_exact(ENTRY_LEN)
+        raw.as_chunks::<ENTRY_LEN>()
+            .0
+            .iter()
             .map(|e| Entry {
                 id: self.full_epoch(e[1]).map(|ep| (e[0], ep, be24(&e[2..5]))),
                 hash: e[5..13].try_into().unwrap(),
@@ -986,7 +988,9 @@ impl Radio {
         };
         let jitter = self.jitter_ms();
         let mut want: Vec<PktId> = body[1..split]
-            .chunks_exact(REPAIR_ENTRY)
+            .as_chunks::<REPAIR_ENTRY>()
+            .0
+            .iter()
             .filter_map(|e| Some((e[0], self.full_epoch(e[1])?, be24(&e[2..5]))))
             .collect();
         // Their chain stops at seen_seq: send the next few ORDERs too.
@@ -1033,7 +1037,7 @@ impl Radio {
         }
         let new_epoch = cur + 1;
         let hour = u32::from_be_bytes(body[2..6].try_into().unwrap());
-        let mine = body[REKEY_HEAD..split].chunks_exact(REKEY_ENTRY).find(|e| e[0] == self.my_idx);
+        let mine = body[REKEY_HEAD..split].as_chunks::<REKEY_ENTRY>().0.iter().find(|e| e[0] == self.my_idx);
         if let (Some(e), Some(pk)) = (mine, self.pair.get(&0)) {
             let (aead, nonce, aad) = rekey_crypto(pk.bytes(), &self.room_id, new_epoch, hour, self.my_idx);
             let ck = aead

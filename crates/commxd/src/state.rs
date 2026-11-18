@@ -128,7 +128,7 @@ pub struct Peer {
     tokens: f64,
     refilled: Instant,
     /// UDP fast path for voice (direct-TCP mode only).
-    pub udp: Option<UdpPath>,
+    pub udp: Option<Box<UdpPath>>,
     _cancel: oneshot::Sender<()>,
 }
 
@@ -143,7 +143,7 @@ impl Peer {
             overflowed: AtomicBool::new(false),
             tokens: SUBMIT_BURST,
             refilled: Instant::now(),
-            udp,
+            udp: udp.map(Box::new),
             _cancel: cancel,
         }
     }

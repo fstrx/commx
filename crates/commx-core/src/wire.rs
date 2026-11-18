@@ -70,6 +70,31 @@ pub enum WireMsg {
     RadioGo { room_id: RoomId, head: [u8; 32], grace_secs: u64, hour: u32, sig: Vec<u8> },
 }
 
+/// Noise prologue. Peers speaking a different channel version fail the
+/// handshake outright instead of breaking later.
+pub const NOISE_PROLOGUE: &[u8] = b"commx-noise-v2";
+
+/// Each direction re-keys its Noise cipher (Noise §11.3) after this many
+/// frames, so a key taken from a running node opens at most the last few
+/// frames of recorded traffic. Heartbeats alone get there in ~5 minutes.
+pub const REKEY_EVERY: u64 = 64;
+
+/// Bytes of fresh randomness each side puts in its encrypted handshake payload.
+pub const HANDSHAKE_SECRET_LEN: usize = 32;
+
+/// A per-channel secret for keys outside Noise (the UDP voice path).
+///
+/// The handshake hash is *not* secret: an eavesdropper can recompute it from
+/// the handshake messages. This mixes in both sides' encrypted handshake
+/// payloads, which only the two ends ever see.
+pub fn channel_secret(handshake_hash: &[u8], responder_rand: &[u8], initiator_rand: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key("commx channel secret v2");
+    h.update(handshake_hash);
+    h.update(responder_rand);
+    h.update(initiator_rand);
+    *h.finalize().as_bytes()
+}
+
 pub fn channel_binding(handshake_hash: &[u8], role: &str) -> Vec<u8> {
     let mut v = b"commx-chan-v1:".to_vec();
     v.extend_from_slice(role.as_bytes());
