@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "commx"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "commx-android"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "commx-core",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "commx-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "commx-radio"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "commx-voice"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "commx-core",
@@ -517,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "commx-web"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -536,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "commxd"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blake3",
