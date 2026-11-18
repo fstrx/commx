@@ -18,7 +18,8 @@ use zeroize::Zeroizing;
 
 use crate::airtime::{Budget, LoRa};
 use crate::packet::{
-    mac, short_hash, signing_bytes, EpochKeys, Header, Kind, MAC_LEN, MAX_CTR, MAX_TEXT, MTU, OVERHEAD, SIG_LEN,
+    bucket, mac, short_hash, signing_bytes, unix_hour, unpad, EpochChain, Header, Kind, MAC_LEN, MAX_CTR, MAX_TEXT,
+    MTU, OVERHEAD, SIG_LEN,
 };
 
 /// Most entries one `ORDER` sequences: 32 + 4 + 10 × 13 + 64 = 230.
@@ -27,9 +28,17 @@ const ENTRY_LEN: usize = 13;
 /// Most packets one `REPAIR` asks for: 32 + 1 + 37 × 5 + 8 = 226.
 const REPAIR_MAX: usize = 37;
 const REPAIR_ENTRY: usize = 5;
-/// Members whose new key fits in one `REKEY`: 32 + 1 + 2 × 49 + 64 = 195.
+/// Members whose new key fits in one `REKEY`: 32 + 6 + 2 × 49 + 64 = 200.
 const REKEY_MAX: usize = 2;
+/// `index || AEAD(chain_key)`.
 const REKEY_ENTRY: usize = 1 + 32 + 16;
+/// `new_epoch || n || BE32(hour)` before the entries.
+const REKEY_HEAD: usize = 6;
+/// A member this far behind the chain can't catch up: the packets it needs
+/// are sealed under hour keys that have been erased.
+const BEHIND_LIMIT_MS: u64 = 60 * 60_000;
+/// Missing messages stop being asked for after this long, for the same reason.
+const WANTED_TTL_MS: u64 = 90 * 60_000;
 /// Messages waiting for airtime before `send_text` refuses more.
 const TEXT_QUEUE: usize = 8;
 const CACHE_CAP: usize = 512;
@@ -50,8 +59,11 @@ pub struct Setup {
     pub me: Arc<Identity>,
     /// Radio index order. Index 0 is the host.
     pub members: Vec<Member>,
+    /// Wiped as soon as the radio's own key chain is derived from it.
     pub room_key: Locked<32>,
     pub epoch: u32,
+    /// Unix hour the host named at handover: the radio key chain starts there.
+    pub start_hour: u32,
     /// Head of the room's IP chain at handover. Every member must agree on it.
     pub ip_head: [u8; 32],
     pub kill_mode: KillMode,
@@ -103,8 +115,7 @@ enum Out {
 }
 
 struct PendingRekey {
-    epoch: u32,
-    key: Locked<32>,
+    chain: EpochChain,
     left: usize,
 }
 
@@ -163,8 +174,7 @@ pub struct Radio {
     grace_ms: u64,
 
     /// Ascending epochs, at most two: the current one last.
-    keys: Vec<EpochKeys>,
-    room_key: Locked<32>,
+    keys: Vec<EpochChain>,
     /// Host: one per member. Member: one, with the host, under index 0.
     pair: HashMap<u8, Locked<32>>,
     ctrs: HashMap<u32, u32>,
@@ -182,8 +192,11 @@ pub struct Radio {
 
     msgs: HashMap<PktId, MsgState>,
     msg_fifo: VecDeque<PktId>,
-    /// Sequenced packets we haven't heard, with the hash the host gave.
-    wanted: HashMap<PktId, [u8; 8]>,
+    /// Sequenced packets we haven't heard, with the hash the host gave and
+    /// when we learned of them.
+    wanted: HashMap<PktId, ([u8; 8], u64)>,
+    /// Since when our chain has been behind what others report.
+    behind_since: Option<u64>,
     cache: HashMap<PktId, Vec<u8>>,
     cache_fifo: VecDeque<PktId>,
     order_ids: BTreeMap<u32, PktId>,
@@ -231,20 +244,31 @@ fn be24(b: &[u8]) -> u32 {
     u32::from_be_bytes([0, b[0], b[1], b[2]])
 }
 
-fn rekey_crypto(pair: &[u8; 32], room_id: &RoomId, epoch: u32, idx: u8) -> (XChaCha20Poly1305, [u8; 24], Vec<u8>) {
-    let mut m = [0u8; 5];
+/// The nonce covers the hour, so a resend in a later hour (a different
+/// chain key) never reuses one.
+fn rekey_crypto(
+    pair: &[u8; 32],
+    room_id: &RoomId,
+    epoch: u32,
+    hour: u32,
+    idx: u8,
+) -> (XChaCha20Poly1305, [u8; 24], Vec<u8>) {
+    let mut m = [0u8; 9];
     m[..4].copy_from_slice(&epoch.to_be_bytes());
-    m[4] = idx;
+    m[4..8].copy_from_slice(&hour.to_be_bytes());
+    m[8] = idx;
     let nonce: [u8; 24] = blake3::derive_key("commx radio rekey nonce v1", &m)[..24].try_into().unwrap();
     let mut aad = room_id.to_vec();
     aad.extend_from_slice(&m);
     (XChaCha20Poly1305::new(Key::from_slice(pair)), nonce, aad)
 }
 
-/// Pad to a multiple of 16 so sizes say less about content.
+/// Zero-pad text so the whole `MSG` fills its size class. The padding sits
+/// inside the signature, which stays last.
 fn pad(text: &str) -> Vec<u8> {
     let mut v = text.as_bytes().to_vec();
-    v.resize(v.len().div_ceil(16).saturating_mul(16).clamp(v.len(), MAX_TEXT), 0);
+    let target = bucket(v.len() + SIG_LEN) - OVERHEAD - SIG_LEN;
+    v.resize(target.max(v.len()), 0);
     v
 }
 
@@ -270,6 +294,9 @@ impl Radio {
             pair.insert(0, pair_key(&s.me, &s.members[0].id.dh_pk, &s.room_id));
         }
         let head = chain_start(&s.room_id, &s.ip_head);
+        let mut chain = EpochChain::from_room_key(s.epoch, s.start_hour, s.room_key.bytes());
+        chain.advance_to(unix_hour(now));
+        // `s.room_key` drops (and is wiped) at the end of this function.
         let heard = (0..s.members.len() as u8).map(|i| (i, now)).collect();
         Ok(Self {
             room_id: s.room_id,
@@ -278,8 +305,7 @@ impl Radio {
             members: s.members.into_iter().map(Some).collect(),
             kill_mode: s.kill_mode,
             grace_ms: s.grace_ms.max(4_000),
-            keys: vec![EpochKeys::derive(s.epoch, s.room_key.bytes())],
-            room_key: s.room_key,
+            keys: vec![chain],
             pair,
             ctrs: HashMap::new(),
             replay: HashMap::new(),
@@ -292,6 +318,7 @@ impl Radio {
             msgs: HashMap::new(),
             msg_fifo: VecDeque::new(),
             wanted: HashMap::new(),
+            behind_since: None,
             cache: HashMap::new(),
             cache_fifo: VecDeque::new(),
             order_ids: BTreeMap::new(),
@@ -358,8 +385,30 @@ impl Radio {
         self.members.get(idx as usize)?.as_ref()
     }
 
-    fn keys_for(&self, epoch: u32) -> Option<&EpochKeys> {
+    fn keys_for(&self, epoch: u32) -> Option<&EpochChain> {
         self.keys.iter().find(|k| k.epoch == epoch)
+    }
+
+    /// Ratchet every key chain to the current hour.
+    fn advance(&mut self, now: u64) {
+        self.now = now;
+        let h = unix_hour(now);
+        for k in &mut self.keys {
+            k.advance_to(h);
+        }
+        if let Some(p) = &mut self.pending_rekey {
+            p.chain.advance_to(h);
+        }
+    }
+
+    /// Find the keys for a packet and open it.
+    fn open_any(&self, pkt: &[u8]) -> Option<(u32, Header, Zeroizing<Vec<u8>>)> {
+        let tag = pkt.get(..4)?;
+        self.keys.iter().find_map(|c| {
+            let k = c.find(tag)?;
+            let (h, b) = k.open(pkt)?;
+            Some((k.epoch, h, b))
+        })
     }
 
     fn full_epoch(&self, low: u8) -> Option<u32> {
@@ -432,22 +481,23 @@ impl Radio {
         self.texts.len()
     }
 
+    /// On-air size of what `out` would build.
     fn out_len(&self, out: &Out) -> Option<usize> {
         Some(match out {
-            Out::Msg(t) => OVERHEAD + pad(t).len() + SIG_LEN,
-            Out::Order => OVERHEAD + 4 + ENTRY_LEN * self.unordered.len().min(ORDER_MAX) + SIG_LEN,
-            Out::Beat => OVERHEAD + MAC_LEN,
-            Out::Repair => OVERHEAD + 1 + REPAIR_ENTRY * self.wanted.len().min(REPAIR_MAX) + MAC_LEN,
+            Out::Msg(t) => bucket(pad(t).len() + SIG_LEN),
+            Out::Order => bucket(4 + ENTRY_LEN * self.unordered.len().min(ORDER_MAX) + SIG_LEN),
+            Out::Beat => bucket(MAC_LEN),
+            Out::Repair => bucket(1 + REPAIR_ENTRY * self.wanted.len().min(REPAIR_MAX) + MAC_LEN),
             Out::Raw(id) => self.cache.get(id)?.len(),
-            Out::Remove(_) => OVERHEAD + 1 + SIG_LEN,
-            Out::Rekey { idxs, .. } => OVERHEAD + 1 + REKEY_ENTRY * idxs.len() + SIG_LEN,
+            Out::Remove(_) => bucket(1 + SIG_LEN),
+            Out::Rekey { idxs, .. } => bucket(REKEY_HEAD + REKEY_ENTRY * idxs.len() + SIG_LEN),
         })
     }
 
     /// Next packet to put on the air, if there is one and the airtime
     /// budget allows it. Call after `tick` and after each received packet.
     pub fn poll_transmit(&mut self, now: u64) -> Option<Vec<u8>> {
-        self.now = now;
+        self.advance(now);
         if self.dead {
             return self.final_out.pop_front();
         }
@@ -491,8 +541,8 @@ impl Radio {
         self.me.sign(&signing_bytes(&self.room_id, hdr, body))
     }
 
-    fn seal(&self, epoch: u32, now: u64, hdr: &Header, body: &[u8]) -> Option<Vec<u8>> {
-        Some(self.keys_for(epoch)?.seal(now, hdr, body))
+    fn seal(&self, epoch: u32, hdr: &Header, body: &[u8]) -> Option<Vec<u8>> {
+        Some(self.keys_for(epoch)?.current().seal(hdr, body))
     }
 
     fn build(&mut self, out: Out, now: u64) -> Option<Vec<u8>> {
@@ -524,7 +574,7 @@ impl Radio {
                 let mut body = Zeroizing::new(pad(&text));
                 let sig = self.sign(&hdr, &body);
                 body.extend_from_slice(&sig);
-                let pkt = self.seal(epoch, now, &hdr, &body)?;
+                let pkt = self.seal(epoch, &hdr, &body)?;
                 let hash = short_hash(&pkt);
                 let next_retry = now + 2 * self.order_ms();
                 self.track(
@@ -552,7 +602,7 @@ impl Radio {
                 }
                 let sig = self.sign(&hdr, &body);
                 body.extend_from_slice(&sig);
-                let pkt = self.seal(epoch, now, &hdr, &body)?;
+                let pkt = self.seal(epoch, &hdr, &body)?;
                 self.last_order = now;
                 if n > 0 {
                     let first = self.next_seq;
@@ -565,10 +615,11 @@ impl Radio {
             }
             Out::Beat => {
                 let m = mac(self.pair.get(&0)?.bytes(), &hdr, &[]);
-                self.seal(epoch, now, &hdr, &m)
+                self.seal(epoch, &hdr, &m)
             }
             Out::Repair => {
                 let ids: Vec<PktId> = self.wanted.keys().take(REPAIR_MAX).copied().collect();
+                debug_assert!(ids.len() <= REPAIR_MAX);
                 let mut body = vec![ids.len() as u8];
                 for (s, e, c) in ids {
                     body.push(s);
@@ -578,37 +629,40 @@ impl Radio {
                 let m = mac(self.pair.get(&0)?.bytes(), &hdr, &body);
                 body.extend_from_slice(&m);
                 self.repair_due = now + self.order_ms();
-                self.seal(epoch, now, &hdr, &body)
+                self.seal(epoch, &hdr, &body)
             }
             Out::Remove(idx) => {
                 let mut body = vec![idx];
                 let sig = self.sign(&hdr, &body);
                 body.extend_from_slice(&sig);
-                self.seal(epoch, now, &hdr, &body)
+                self.seal(epoch, &hdr, &body)
             }
             Out::Rekey { epoch: new_epoch, idxs } => {
-                let key = match &self.pending_rekey {
-                    Some(p) if p.epoch == new_epoch => p.key.clone(),
-                    _ if epoch == new_epoch => self.room_key.clone(),
+                let chain = match &self.pending_rekey {
+                    Some(p) if p.chain.epoch == new_epoch => &p.chain,
+                    _ if epoch == new_epoch => self.keys.last()?,
                     _ => return None,
                 };
-                let mut body = vec![new_epoch as u8];
+                let (hour, ck) = chain.chain_key();
+                let idxs: Vec<u8> = idxs.into_iter().filter(|i| self.pair.contains_key(i)).collect();
+                let mut body = vec![new_epoch as u8, idxs.len() as u8];
+                body.extend_from_slice(&hour.to_be_bytes());
                 for idx in idxs {
-                    let Some(pk) = self.pair.get(&idx) else { continue };
-                    let (aead, nonce, aad) = rekey_crypto(pk.bytes(), &self.room_id, new_epoch, idx);
-                    let ct = aead.encrypt(XNonce::from_slice(&nonce), Payload { msg: key.bytes(), aad: &aad }).ok()?;
+                    let pk = self.pair.get(&idx)?;
+                    let (aead, nonce, aad) = rekey_crypto(pk.bytes(), &self.room_id, new_epoch, hour, idx);
+                    let ct = aead.encrypt(XNonce::from_slice(&nonce), Payload { msg: ck, aad: &aad }).ok()?;
                     body.push(idx);
                     body.extend_from_slice(&ct);
                 }
                 let sig = self.sign(&hdr, &body);
                 body.extend_from_slice(&sig);
-                let pkt = self.seal(hdr_epoch, now, &hdr, &body);
+                let pkt = self.seal(hdr_epoch, &hdr, &body);
                 if let Some(p) = &mut self.pending_rekey {
-                    if p.epoch == new_epoch {
+                    if p.chain.epoch == new_epoch {
                         p.left = p.left.saturating_sub(1);
                         if p.left == 0 {
                             let p = self.pending_rekey.take()?;
-                            self.switch_epoch(p.epoch, p.key);
+                            self.switch_epoch(p.chain);
                         }
                     }
                 }
@@ -618,12 +672,13 @@ impl Radio {
         }
     }
 
-    fn switch_epoch(&mut self, epoch: u32, key: Locked<32>) {
-        self.keys.push(EpochKeys::derive(epoch, key.bytes()));
+    fn switch_epoch(&mut self, mut chain: EpochChain) {
+        chain.advance_to(unix_hour(self.now));
+        let epoch = chain.epoch;
+        self.keys.push(chain);
         if self.keys.len() > 2 {
             self.keys.remove(0);
         }
-        self.room_key = key;
         self.events.push_back(Event::Rekeyed { epoch });
     }
 
@@ -631,13 +686,11 @@ impl Radio {
 
     /// Handle one packet heard on the air.
     pub fn on_packet(&mut self, pkt: &[u8], now: u64) {
-        self.now = now;
         if self.dead || pkt.len() < OVERHEAD || pkt.len() > MTU {
             return;
         }
-        let Some(ki) = self.keys.iter().position(|k| k.matches(&pkt[..4], now)) else { return };
-        let Some((hdr, body)) = self.keys[ki].open(pkt) else { return };
-        let epoch = self.keys[ki].epoch;
+        self.advance(now);
+        let Some((epoch, hdr, body)) = self.open_any(pkt) else { return };
         if hdr.sender == self.my_idx || self.member(hdr.sender).is_none() {
             return;
         }
@@ -682,10 +735,13 @@ impl Radio {
         }
     }
 
-    fn host_signed(&self, hdr: &Header, body: &[u8]) -> std::result::Result<usize, String> {
+    /// Check a host-signed packet whose unpadded body is `body[..len]`
+    /// (signature last). Returns where the signature starts.
+    fn host_signed(&self, hdr: &Header, body: &[u8], len: usize) -> std::result::Result<usize, String> {
         if hdr.sender != 0 {
             return Err(format!("{} sent a host-only packet", self.name(hdr.sender)));
         }
+        let body = unpad(body, len).ok_or("malformed packet from the host")?;
         let Some(split) = body.len().checked_sub(SIG_LEN) else {
             return Err("malformed packet from the host".into());
         };
@@ -712,7 +768,7 @@ impl Radio {
             return Ok(Verdict::Authentic);
         }
         let hash = short_hash(pkt);
-        let confirmed = match self.wanted.remove(&id) {
+        let confirmed = match self.wanted.remove(&id).map(|(h, _)| h) {
             Some(want) if want != hash => {
                 return Err(format!("a message from {from} doesn't match the host's order"));
             }
@@ -753,11 +809,11 @@ impl Radio {
     }
 
     fn on_order(&mut self, hdr: &Header, body: &[u8], pkt: &[u8], id: PktId, fresh: bool) -> Handled {
-        let split = self.host_signed(hdr, body)?;
-        let body = &body[..split];
-        if body.len() < 4 || body.len() != 4 + ENTRY_LEN * body[3] as usize || body[3] as usize > ORDER_MAX {
+        if body.len() < 4 || body[3] as usize > ORDER_MAX {
             return Err("malformed order from the host".into());
         }
+        let split = self.host_signed(hdr, body, 4 + ENTRY_LEN * body[3] as usize + SIG_LEN)?;
+        let body = &body[..split];
         let first = be24(body);
         let n = body[3] as u32;
         let entries = &body[4..];
@@ -787,7 +843,7 @@ impl Radio {
         self.apply_order(first, entries, pkt, id)?;
         // Anything stashed that now fits.
         while let Some((id, raw)) = self.stash.remove(&self.next_seq) {
-            let Some((_, body)) = self.keys_for(id.1).and_then(|k| k.open(&raw)) else { continue };
+            let Some((_, _, body)) = self.open_any(&raw) else { continue };
             let n = body[3] as usize;
             let first = self.next_seq;
             self.apply_order(first, &body[4..4 + n * ENTRY_LEN], &raw, id)?;
@@ -833,7 +889,7 @@ impl Radio {
                     return Err("the host's order names a message I never sent".into());
                 }
                 None => {
-                    self.wanted.insert(eid, e.hash);
+                    self.wanted.insert(eid, (e.hash, self.now));
                 }
             }
         }
@@ -907,15 +963,18 @@ impl Radio {
     }
 
     fn on_beat(&mut self, hdr: &Header, body: &[u8], fresh: bool) -> Handled {
-        if !self.is_host() || !fresh || body.len() != MAC_LEN {
+        let Some(body) = unpad(body, MAC_LEN).filter(|_| self.is_host() && fresh) else {
             return Ok(Verdict::Ignored);
-        }
+        };
         let Some(pk) = self.pair.get(&hdr.sender) else { return Ok(Verdict::Ignored) };
         Ok(if mac(pk.bytes(), hdr, &[]) == body[..] { Verdict::Authentic } else { Verdict::Ignored })
     }
 
     fn on_repair(&mut self, hdr: &Header, body: &[u8], fresh: bool, now: u64) -> Handled {
-        if !fresh || body.len() < 1 + MAC_LEN || body.len() != 1 + REPAIR_ENTRY * body[0] as usize + MAC_LEN {
+        let Some(body) = body.first().and_then(|&n| unpad(body, 1 + REPAIR_ENTRY * n as usize + MAC_LEN)) else {
+            return Ok(Verdict::Ignored);
+        };
+        if !fresh {
             return Ok(Verdict::Ignored);
         }
         let split = body.len() - MAC_LEN;
@@ -946,8 +1005,8 @@ impl Radio {
     }
 
     fn on_remove(&mut self, hdr: &Header, body: &[u8], fresh: bool) -> Handled {
-        let split = self.host_signed(hdr, body)?;
-        if split != 1 || !fresh {
+        self.host_signed(hdr, body, 1 + SIG_LEN)?;
+        if !fresh {
             return Ok(Verdict::Ignored);
         }
         let idx = body[0];
@@ -963,32 +1022,33 @@ impl Radio {
     }
 
     fn on_rekey(&mut self, hdr: &Header, body: &[u8], fresh: bool) -> Handled {
-        let split = self.host_signed(hdr, body)?;
-        if split < 1 || (split - 1) % REKEY_ENTRY != 0 {
+        if body.len() < 2 || body[1] as usize > REKEY_MAX {
             return Err("malformed rekey from the host".into());
         }
+        let split = self.host_signed(hdr, body, REKEY_HEAD + REKEY_ENTRY * body[1] as usize + SIG_LEN)?;
         let cur = self.epoch();
         if body[0] != cur.wrapping_add(1) as u8 {
             // Old news, or a rekey we already have.
             return Ok(if fresh { Verdict::Authentic } else { Verdict::Ignored });
         }
         let new_epoch = cur + 1;
-        let mine = body[1..split].chunks_exact(REKEY_ENTRY).find(|e| e[0] == self.my_idx);
+        let hour = u32::from_be_bytes(body[2..6].try_into().unwrap());
+        let mine = body[REKEY_HEAD..split].chunks_exact(REKEY_ENTRY).find(|e| e[0] == self.my_idx);
         if let (Some(e), Some(pk)) = (mine, self.pair.get(&0)) {
-            let (aead, nonce, aad) = rekey_crypto(pk.bytes(), &self.room_id, new_epoch, self.my_idx);
-            let key = aead
+            let (aead, nonce, aad) = rekey_crypto(pk.bytes(), &self.room_id, new_epoch, hour, self.my_idx);
+            let ck = aead
                 .decrypt(XNonce::from_slice(&nonce), Payload { msg: &e[1..], aad: &aad })
                 .map(Zeroizing::new)
                 .map_err(|_| "the host's new room key doesn't open".to_string())?;
-            let key: &[u8; 32] = key.as_slice().try_into().map_err(|_| "bad room key length".to_string())?;
-            self.switch_epoch(new_epoch, Locked::from_bytes(key));
+            let ck: &[u8; 32] = ck.as_slice().try_into().map_err(|_| "bad room key length".to_string())?;
+            self.switch_epoch(EpochChain::start(new_epoch, hour, ck));
             self.ctrs.retain(|e, _| *e >= cur);
         }
         Ok(if fresh { Verdict::Authentic } else { Verdict::Ignored })
     }
 
     fn on_nuke(&mut self, hdr: &Header, body: &[u8]) -> Handled {
-        match self.host_signed(hdr, body) {
+        match self.host_signed(hdr, body, SIG_LEN) {
             Ok(0) => Err("host nuked the room".into()),
             _ => Ok(Verdict::Ignored),
         }
@@ -998,10 +1058,10 @@ impl Radio {
 
     /// Run timers: liveness, ordering, repair, rebroadcasts, beats.
     pub fn tick(&mut self, now: u64) {
-        self.now = now;
         if self.dead {
             return;
         }
+        self.advance(now);
         // Liveness: minutes, not seconds.
         if self.is_host() {
             let silent: Vec<u8> = self
@@ -1065,7 +1125,15 @@ impl Radio {
                 self.ctl.push_back(Out::Order);
             }
         } else {
-            let behind = !self.wanted.is_empty() || !self.stash.is_empty() || self.target_seq > self.next_seq;
+            self.wanted.retain(|_, (_, since)| now.saturating_sub(*since) < WANTED_TTL_MS);
+            let chain_gap = !self.stash.is_empty() || self.target_seq > self.next_seq;
+            if !chain_gap {
+                self.behind_since = None;
+            } else if now.saturating_sub(*self.behind_since.get_or_insert(now)) > BEHIND_LIMIT_MS {
+                self.die("fell too far behind the room to catch up");
+                return;
+            }
+            let behind = !self.wanted.is_empty() || chain_gap;
             if behind && now >= self.repair_due && !self.ctl.contains(&Out::Repair) {
                 self.ctl.push_back(Out::Repair);
                 self.repair_due = now + self.order_ms();
@@ -1086,13 +1154,15 @@ impl Radio {
         self.ctl.push_back(Out::Remove(idx));
         let new_epoch = self.epoch() + 1;
         let rest: Vec<u8> = (1..self.members.len() as u8).filter(|&i| self.member(i).is_some()).collect();
-        let key = Locked::<32>::random();
+        // A fresh random chain: nothing about it follows from earlier keys.
+        let seed = Locked::<32>::random();
+        let chain = EpochChain::start(new_epoch, unix_hour(self.now), seed.bytes());
         if rest.is_empty() {
-            self.switch_epoch(new_epoch, key);
+            self.switch_epoch(chain);
             return;
         }
         let chunks: Vec<Vec<u8>> = rest.chunks(REKEY_MAX).map(<[u8]>::to_vec).collect();
-        self.pending_rekey = Some(PendingRekey { epoch: new_epoch, key, left: chunks.len() });
+        self.pending_rekey = Some(PendingRekey { chain, left: chunks.len() });
         for idxs in chunks {
             self.ctl.push_back(Out::Rekey { epoch: new_epoch, idxs });
         }
@@ -1127,7 +1197,7 @@ impl Radio {
             let epoch = self.epoch();
             if let Some(hdr) = self.header(Kind::Nuke, epoch) {
                 let sig = self.sign(&hdr, &[]);
-                if let Some(pkt) = self.seal(epoch, self.now, &hdr, &sig) {
+                if let Some(pkt) = self.seal(epoch, &hdr, &sig) {
                     self.final_out.push_back(pkt.clone());
                     self.final_out.push_back(pkt);
                 }
@@ -1137,7 +1207,7 @@ impl Radio {
         // Wipe: keys are on locked pages and zeroize on drop.
         self.keys.clear();
         self.pair.clear();
-        self.room_key = Locked::zeroed();
+        self.pending_rekey = None;
         self.msgs.clear();
         self.cache.clear();
         self.wanted.clear();

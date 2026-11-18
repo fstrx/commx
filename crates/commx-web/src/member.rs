@@ -48,10 +48,11 @@ struct Transport {
 
 impl Transport {
     fn seal(&mut self, msg: &WireMsg) -> Result<Vec<u8>> {
-        let plain = Zeroizing::new(wire::encode(msg));
+        let mut plain = Zeroizing::new(wire::encode(msg));
         if plain.len() > MAX_FRAME - TAG {
             bail!("message too large");
         }
+        wire::pad(&mut plain, MAX_FRAME - TAG);
         let mut out = vec![0u8; plain.len() + TAG];
         let n = self.noise.write_message(self.tx_nonce, &plain, &mut out)?;
         self.tx_nonce += 1;

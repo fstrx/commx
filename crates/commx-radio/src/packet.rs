@@ -98,35 +98,45 @@ impl Header {
     }
 }
 
-/// Keys for one room-key epoch. Both live on locked pages.
-pub struct EpochKeys {
-    pub epoch: u32,
-    radio: Locked<32>,
-    hp: Locked<32>,
+/// Packet sizes on the air. Every packet is padded up to one of these, so
+/// its length says little about its type or content.
+pub const SIZES: [usize; 4] = [64, 128, 176, MTU];
+
+/// The on-air size of a packet whose body is `body_len` bytes.
+pub fn bucket(body_len: usize) -> usize {
+    let total = OVERHEAD + body_len;
+    SIZES.iter().copied().find(|&s| s >= total).unwrap_or(total)
+}
+
+/// `body[..len]` if everything after it is zero padding.
+pub fn unpad(body: &[u8], len: usize) -> Option<&[u8]> {
+    (body.len() >= len && body[len..].iter().all(|&b| b == 0)).then(|| &body[..len])
 }
 
 pub fn unix_hour(now_ms: u64) -> u32 {
     (now_ms / 3_600_000) as u32
 }
 
-impl EpochKeys {
-    pub fn derive(epoch: u32, room_key: &[u8; 32]) -> Self {
-        let radio = Zeroizing::new(blake3::derive_key("commx radio key v1", room_key));
-        let hp = Zeroizing::new(blake3::derive_key("commx radio hp v1", room_key));
-        Self { epoch, radio: Locked::from_bytes(&radio), hp: Locked::from_bytes(&hp) }
+/// Packet keys for one epoch during one unix hour. Both live on locked pages.
+pub struct HourKeys {
+    pub epoch: u32,
+    pub hour: u32,
+    radio: Locked<32>,
+    hp: Locked<32>,
+}
+
+impl HourKeys {
+    fn derive(epoch: u32, hour: u32, chain: &[u8; 32]) -> Self {
+        let radio = Zeroizing::new(blake3::derive_key("commx radio key v1", chain));
+        let hp = Zeroizing::new(blake3::derive_key("commx radio hp v1", chain));
+        Self { epoch, hour, radio: Locked::from_bytes(&radio), hp: Locked::from_bytes(&hp) }
     }
 
-    pub fn tag(&self, hour: u32) -> [u8; TAG_LEN] {
+    pub fn tag(&self) -> [u8; TAG_LEN] {
         let mut m = [0u8; 7];
         m[..3].copy_from_slice(b"tag");
-        m[3..].copy_from_slice(&hour.to_be_bytes());
+        m[3..].copy_from_slice(&self.hour.to_be_bytes());
         blake3::keyed_hash(self.radio.bytes(), &m).as_bytes()[..TAG_LEN].try_into().unwrap()
-    }
-
-    /// Does this packet's tag belong to us, within an hour either side?
-    pub fn matches(&self, tag: &[u8], now_ms: u64) -> bool {
-        let h = unix_hour(now_ms);
-        [h.wrapping_sub(1), h, h.wrapping_add(1)].iter().any(|&h| self.tag(h) == tag)
     }
 
     fn nonce(&self, sender: u8, ctr: u32) -> [u8; 24] {
@@ -141,28 +151,32 @@ impl EpochKeys {
         blake3::keyed_hash(self.hp.bytes(), &ct[..16]).as_bytes()[..HDR_LEN].try_into().unwrap()
     }
 
-    /// Build a packet. The caller guarantees `(sender, ctr)` is fresh for this epoch.
-    pub fn seal(&self, now_ms: u64, hdr: &Header, body: &[u8]) -> Vec<u8> {
+    /// Build a packet, zero-padding the body up to its size class. The caller
+    /// guarantees `(sender, ctr)` is fresh for this epoch.
+    pub fn seal(&self, hdr: &Header, body: &[u8]) -> Vec<u8> {
         debug_assert_eq!(hdr.epoch, self.epoch as u8);
-        let tag = self.tag(unix_hour(now_ms));
+        let mut padded = Zeroizing::new(body.to_vec());
+        padded.resize(bucket(body.len()) - OVERHEAD, 0);
+        let tag = self.tag();
         let plain_hdr = hdr.encode();
         let mut aad = [0u8; TAG_LEN + HDR_LEN];
         aad[..TAG_LEN].copy_from_slice(&tag);
         aad[TAG_LEN..].copy_from_slice(&plain_hdr);
         let ct = XChaCha20Poly1305::new(Key::from_slice(self.radio.bytes()))
-            .encrypt(XNonce::from_slice(&self.nonce(hdr.sender, hdr.ctr)), Payload { msg: body, aad: &aad })
+            .encrypt(XNonce::from_slice(&self.nonce(hdr.sender, hdr.ctr)), Payload { msg: &padded, aad: &aad })
             .expect("radio seal");
         let mask = self.mask(&ct);
-        let mut pkt = Vec::with_capacity(OVERHEAD + body.len());
+        let mut pkt = Vec::with_capacity(OVERHEAD + padded.len());
         pkt.extend_from_slice(&tag);
         pkt.extend(plain_hdr.iter().zip(mask).map(|(h, m)| h ^ m));
         pkt.extend_from_slice(&ct);
         pkt
     }
 
-    /// Unmask and decrypt. `None` for anything that isn't a valid packet under this epoch.
+    /// Unmask and decrypt. `None` for anything that isn't a valid packet
+    /// under these keys. The body comes back with its padding.
     pub fn open(&self, pkt: &[u8]) -> Option<(Header, Zeroizing<Vec<u8>>)> {
-        if pkt.len() < OVERHEAD || pkt.len() > MTU {
+        if pkt.len() < OVERHEAD || pkt.len() > MTU || pkt[..TAG_LEN] != self.tag() {
             return None;
         }
         let (tag, rest) = pkt.split_at(TAG_LEN);
@@ -183,6 +197,87 @@ impl EpochKeys {
             .decrypt(XNonce::from_slice(&self.nonce(hdr.sender, hdr.ctr)), Payload { msg: ct, aad: &aad })
             .ok()?;
         Some((hdr, Zeroizing::new(body)))
+    }
+}
+
+/// Longest gap the ratchet will step across in one go (two weeks of hours).
+const MAX_STEPS: u32 = 24 * 14;
+
+/// One epoch's forward-secret key chain: `C(h+1) = KDF(C(h))`, and each
+/// link is erased once its hour is two hours gone. Someone who later takes a
+/// node's memory reads at most the last hour or so of recorded traffic.
+pub struct EpochChain {
+    pub epoch: u32,
+    /// `chain` is `C(hour)`.
+    hour: u32,
+    chain: Locked<32>,
+    prev: Option<HourKeys>,
+    cur: HourKeys,
+    next: HourKeys,
+}
+
+fn ratchet(c: &[u8; 32]) -> Locked<32> {
+    Locked::from_bytes(&Zeroizing::new(blake3::derive_key("commx radio ratchet v1", c)))
+}
+
+impl EpochChain {
+    /// Start from a chain key handed over directly (a `REKEY`).
+    pub fn start(epoch: u32, hour: u32, chain: &[u8; 32]) -> Self {
+        let chain = Locked::from_bytes(chain);
+        let next = HourKeys::derive(epoch, hour.wrapping_add(1), ratchet(chain.bytes()).bytes());
+        Self { epoch, hour, cur: HourKeys::derive(epoch, hour, chain.bytes()), chain, prev: None, next }
+    }
+
+    /// Start from a room key at the IP→radio handover. The room key itself
+    /// should be wiped afterwards.
+    pub fn from_room_key(epoch: u32, hour: u32, room_key: &[u8; 32]) -> Self {
+        let mut m = Zeroizing::new([0u8; 36]);
+        m[..32].copy_from_slice(room_key);
+        m[32..].copy_from_slice(&hour.to_be_bytes());
+        Self::start(epoch, hour, &Zeroizing::new(blake3::derive_key("commx radio chain v1", &m[..])))
+    }
+
+    /// Hour this chain currently sends in.
+    pub fn hour(&self) -> u32 {
+        self.hour
+    }
+
+    /// `(hour, C(hour))`, for handing the chain to a member.
+    pub fn chain_key(&self) -> (u32, &[u8; 32]) {
+        (self.hour, self.chain.bytes())
+    }
+
+    /// Step forward to `hour` (never back), erasing what's left behind.
+    pub fn advance_to(&mut self, hour: u32) {
+        if hour <= self.hour {
+            return;
+        }
+        if hour - self.hour > MAX_STEPS {
+            // Far beyond anything a live room survives; just jump.
+            let mut c = Locked::from_bytes(self.chain.bytes());
+            for _ in 0..MAX_STEPS {
+                c = ratchet(c.bytes());
+            }
+            *self = Self::start(self.epoch, hour, c.bytes());
+            return;
+        }
+        while self.hour < hour {
+            self.chain = ratchet(self.chain.bytes());
+            self.hour += 1;
+            let next = HourKeys::derive(self.epoch, self.hour + 1, ratchet(self.chain.bytes()).bytes());
+            let cur = std::mem::replace(&mut self.next, next);
+            self.prev = Some(std::mem::replace(&mut self.cur, cur));
+        }
+    }
+
+    /// Keys for sending now.
+    pub fn current(&self) -> &HourKeys {
+        &self.cur
+    }
+
+    /// Keys for a received packet's tag: last, this or next hour.
+    pub fn find(&self, tag: &[u8]) -> Option<&HourKeys> {
+        [Some(&self.cur), self.prev.as_ref(), Some(&self.next)].into_iter().flatten().find(|k| k.tag() == tag)
     }
 }
 
@@ -226,31 +321,58 @@ mod tests {
 
     #[test]
     fn seal_open_and_tamper() {
-        let k = EpochKeys::derive(7, &[1; 32]);
-        let now = 1_700_000_000_000;
-        let pkt = k.seal(now, &hdr(), b"hello");
-        assert_eq!(pkt.len(), OVERHEAD + 5);
-        assert!(k.matches(&pkt[..4], now));
-        assert!(k.matches(&pkt[..4], now + 3_600_000), "next hour still accepts last hour's tag");
-        assert!(!k.matches(&pkt[..4], now + 3 * 3_600_000));
-        let (h, body) = k.open(&pkt).unwrap();
-        assert_eq!((h, &body[..]), (hdr(), &b"hello"[..]));
+        let c = EpochChain::start(7, 100, &[1; 32]);
+        let k = c.current();
+        let pkt = k.seal(&hdr(), b"hello");
+        assert_eq!(pkt.len(), 64, "padded to the smallest size");
+        let (h, body) = c.find(&pkt[..4]).unwrap().open(&pkt).unwrap();
+        assert_eq!(h, hdr());
+        assert_eq!(unpad(&body, 5), Some(&b"hello"[..]));
         for i in 0..pkt.len() {
             let mut bad = pkt.clone();
             bad[i] ^= 1;
             assert!(k.open(&bad).is_none(), "flipped byte {i} accepted");
         }
-        assert!(EpochKeys::derive(7, &[2; 32]).open(&pkt).is_none());
+        assert!(EpochChain::start(7, 100, &[2; 32]).current().open(&pkt).is_none());
+    }
+
+    #[test]
+    fn ratchet_keeps_a_window_and_forgets_the_past() {
+        let mut a = EpochChain::start(7, 100, &[1; 32]);
+        let mut b = EpochChain::start(7, 100, &[1; 32]);
+        let at_100 = a.current().seal(&hdr(), b"x");
+        a.advance_to(101);
+        assert!(a.find(&at_100[..4]).is_some(), "an hour late is still fine");
+        let at_101 = a.current().seal(&hdr(), b"x");
+        assert!(b.find(&at_101[..4]).is_some(), "an hour early is fine too");
+        b.advance_to(101);
+        assert_eq!(a.chain_key(), b.chain_key(), "both sides ratchet alike");
+        a.advance_to(102);
+        assert!(a.find(&at_100[..4]).is_none(), "two hours on, the old keys are gone");
+        // Starting a chain from the handed-over key reaches the same place.
+        let (h, k) = b.chain_key();
+        let mut c = EpochChain::start(7, h, k);
+        c.advance_to(102);
+        b.advance_to(102);
+        assert_eq!(c.chain_key(), b.chain_key());
+    }
+
+    #[test]
+    fn sizes_are_classes() {
+        assert_eq!(bucket(8), 64);
+        assert_eq!(bucket(33), 128);
+        assert_eq!(bucket(97), 176);
+        assert_eq!(bucket(198), 230);
+        assert_eq!(unpad(&[1, 2, 0, 0], 2), Some(&[1u8, 2][..]));
+        assert_eq!(unpad(&[1, 2, 0, 9], 2), None);
     }
 
     #[test]
     fn header_is_hidden() {
-        let k = EpochKeys::derive(7, &[1; 32]);
-        let a = k.seal(0, &hdr(), b"x");
-        let b = k.seal(0, &Header { ctr: 0x01_02_04, ..hdr() }, b"x");
-        // Same type and sender, yet the masked header bytes differ throughout.
-        assert_ne!(a[4], b[4]);
-        assert_ne!(a[5], b[5]);
+        let k = EpochChain::start(7, 100, &[1; 32]);
+        let a = k.current().seal(&hdr(), b"x");
+        let b = k.current().seal(&Header { ctr: 0x01_02_04, ..hdr() }, b"x");
+        assert_ne!(&a[4..16], &b[4..16]);
         assert_ne!(&a[4..16], &hdr().encode());
     }
 

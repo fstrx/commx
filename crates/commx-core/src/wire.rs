@@ -65,8 +65,9 @@ pub enum WireMsg {
         proof: [u8; 32],
     },
     /// Host → members: the room continues on the radio profile (SPEC §18)
-    /// from chain head `head`. Signed with `radio_go_bytes`.
-    RadioGo { room_id: RoomId, head: [u8; 32], grace_secs: u64, sig: Vec<u8> },
+    /// from chain head `head`, its key chain starting at unix hour `hour`.
+    /// Signed with `radio_go_bytes`.
+    RadioGo { room_id: RoomId, head: [u8; 32], grace_secs: u64, hour: u32, sig: Vec<u8> },
 }
 
 pub fn channel_binding(handshake_hash: &[u8], role: &str) -> Vec<u8> {
@@ -83,11 +84,12 @@ pub fn nuke_bytes(room_id: &RoomId) -> Vec<u8> {
     v
 }
 
-pub fn radio_go_bytes(room_id: &RoomId, head: &[u8; 32], grace_secs: u64) -> Vec<u8> {
+pub fn radio_go_bytes(room_id: &RoomId, head: &[u8; 32], grace_secs: u64, hour: u32) -> Vec<u8> {
     let mut v = b"commx-radio-go-v1:".to_vec();
     v.extend_from_slice(room_id);
     v.extend_from_slice(head);
     v.extend_from_slice(&grace_secs.to_be_bytes());
+    v.extend_from_slice(&hour.to_be_bytes());
     v
 }
 
@@ -99,6 +101,59 @@ pub fn encode(msg: &WireMsg) -> Vec<u8> {
     postcard::to_allocvec(msg).expect("serialize wire msg")
 }
 
+/// Encrypted frame size for a `len`-byte message: at least 256, then
+/// powers of two up to 4 KiB, then whole 4 KiB steps. Someone watching the
+/// link (a mesh, a LAN, an ISP) sees one of a few sizes instead of each
+/// message's exact length. Never more than `max`.
+pub fn padded_len(len: usize, max: usize) -> usize {
+    const MIN: usize = 256;
+    const STEP: usize = 4096;
+    let p = if len <= MIN {
+        MIN
+    } else if len <= STEP {
+        len.next_power_of_two()
+    } else {
+        len.div_ceil(STEP) * STEP
+    };
+    p.min(max).max(len)
+}
+
+/// Zero-pad an encoded message to `padded_len`, in place. Decoders ignore
+/// the padding: postcard stops at the end of the message, so peers that
+/// don't pad (and peers that don't expect it) interoperate.
+pub fn pad(encoded: &mut Vec<u8>, max: usize) {
+    let n = padded_len(encoded.len(), max);
+    encoded.resize(n, 0);
+}
+
 pub fn decode(bytes: &[u8]) -> anyhow::Result<WireMsg> {
     Ok(postcard::from_bytes(bytes)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn padded(msg: &WireMsg) -> Vec<u8> {
+        let mut v = encode(msg);
+        pad(&mut v, 65519);
+        v
+    }
+
+    #[test]
+    fn padding_hides_lengths_and_decodes() {
+        let short = WireMsg::Heartbeat;
+        let long = WireMsg::JoinDenied { reason: "x".repeat(300) };
+        assert_eq!(padded(&short).len(), 256);
+        assert_eq!(padded(&WireMsg::JoinDenied { reason: "hi".into() }).len(), 256);
+        assert_eq!(padded(&long).len(), 512);
+        assert!(matches!(decode(&padded(&short)).unwrap(), WireMsg::Heartbeat));
+        match decode(&padded(&long)).unwrap() {
+            WireMsg::JoinDenied { reason } => assert_eq!(reason.len(), 300),
+            _ => panic!(),
+        }
+        assert_eq!(padded_len(5000, 65519), 8192);
+        assert_eq!(padded_len(33_000, 65519), 36_864);
+        assert_eq!(padded_len(65_000, 65519), 65_519);
+    }
 }

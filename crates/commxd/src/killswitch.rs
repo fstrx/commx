@@ -17,7 +17,7 @@ enum After {
     Nothing,
     Gone(&'static str),
     Nuke(String, bool),
-    Radio([u8; 32], u64, Vec<u8>),
+    Radio([u8; 32], u64, u32, Vec<u8>),
 }
 
 impl Daemon {
@@ -58,8 +58,8 @@ impl Daemon {
                 Ok(()) => After::Nothing,
                 Err(e) => After::Nuke(format!("integrity failure, host may be compromised: {e}"), true),
             },
-            (PeerKind::Host, WireMsg::RadioGo { room_id: rid, head, grace_secs, sig }) if rid == room_id => {
-                After::Radio(head, grace_secs, sig)
+            (PeerKind::Host, WireMsg::RadioGo { room_id: rid, head, grace_secs, hour, sig }) if rid == room_id => {
+                After::Radio(head, grace_secs, hour, sig)
             }
             (PeerKind::Host, WireMsg::Nuke { room_id: rid, sig }) => {
                 if rid == room_id && verify_nuke(&room.chain.host_pk, &rid, &sig) {
@@ -74,7 +74,7 @@ impl Daemon {
             After::Nothing => {}
             After::Gone(why) => self.peer_gone(room_id, kind, why),
             After::Nuke(reason, tell) => self.nuke(&room_id, &reason, tell),
-            After::Radio(head, grace, sig) => self.radio_go(&room_id, head, grace, &sig),
+            After::Radio(head, grace, hour, sig) => self.radio_go(&room_id, head, grace, hour, &sig),
         }
         Followup::default()
     }

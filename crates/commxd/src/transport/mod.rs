@@ -292,10 +292,11 @@ pub async fn handshake(stream: Box<dyn Stream>, key: &NodeKey, initiator: bool) 
 
 impl SecureWriter {
     pub async fn send(&mut self, msg: &WireMsg) -> Result<()> {
-        let plain = Zeroizing::new(wire::encode(msg));
+        let mut plain = Zeroizing::new(wire::encode(msg));
         if plain.len() > MAX_NOISE_MSG - TAG_LEN {
             bail!("message too large for one frame");
         }
+        wire::pad(&mut plain, MAX_NOISE_MSG - TAG_LEN);
         let mut out = vec![0u8; plain.len() + TAG_LEN];
         let n = self.noise.write_message(self.nonce, &plain, &mut out)?;
         self.nonce += 1;

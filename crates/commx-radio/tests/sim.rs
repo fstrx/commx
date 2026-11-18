@@ -33,6 +33,8 @@ struct Air {
     lora: LoRa,
     /// Raw packets each node transmitted, for replay tests.
     log: Vec<(usize, Vec<u8>)>,
+    /// Per-node clock error, in ms.
+    skew: Vec<i64>,
 }
 
 struct Opts {
@@ -43,11 +45,13 @@ struct Opts {
     budget: f64,
     lora: LoRa,
     seed: u64,
+    /// Per-node clock error, in ms.
+    skew: Vec<i64>,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Opts { n: 3, loss: 0.0, kill: KillMode::HostOnly, grace: 20 * MIN, budget: 1.0, lora: LoRa::default(), seed: 7 }
+        Opts { n: 3, loss: 0.0, kill: KillMode::HostOnly, grace: 20 * MIN, budget: 1.0, lora: LoRa::default(), seed: 7, skew: vec![] }
     }
 }
 
@@ -65,6 +69,7 @@ fn setups(o: &Opts, ids: &[Arc<Identity>]) -> Vec<Setup> {
             members: members.clone(),
             room_key: key.clone(),
             epoch: 3,
+            start_hour: (T0 / 3_600_000) as u32,
             ip_head: [9; 32],
             kill_mode: o.kill,
             grace_ms: o.grace,
@@ -87,7 +92,8 @@ impl Air {
             .enumerate()
             .map(|(i, s)| Node {
                 r: {
-                    let mut r = Radio::new(s, T0).unwrap();
+                    let t = (T0 as i64 + o.skew.get(i).copied().unwrap_or(0)) as u64;
+                    let mut r = Radio::new(s, t).unwrap();
                     r.reseed(o.seed * 1000 + i as u64);
                     r
                 },
@@ -107,6 +113,7 @@ impl Air {
             now: T0,
             lora: o.lora,
             log: vec![],
+            skew: (0..n).map(|i| o.skew.get(i).copied().unwrap_or(0)).collect(),
         }
     }
 
@@ -118,18 +125,24 @@ impl Air {
             if self.loss > 0.0 && self.rng.gen::<f64>() < self.loss {
                 continue;
             }
-            self.nodes[j].r.on_packet(pkt, self.now);
+            let t = self.clock(j);
+            self.nodes[j].r.on_packet(pkt, t);
         }
+    }
+
+    fn clock(&self, i: usize) -> u64 {
+        (self.now as i64 + self.skew[i]) as u64
     }
 
     fn step(&mut self, dt: u64) {
         self.now += dt;
-        let now = self.now;
         let mut out = vec![];
+        let clocks: Vec<u64> = (0..self.nodes.len()).map(|i| self.clock(i)).collect();
         for (i, n) in self.nodes.iter_mut().enumerate() {
             if !n.alive {
                 continue;
             }
+            let now = clocks[i];
             n.r.tick(now);
             while let Some(p) = n.r.poll_transmit(now) {
                 n.sent.push((now, self.lora.airtime_ms(p.len())));
@@ -161,6 +174,9 @@ impl Air {
     }
 
     fn say(&mut self, i: usize, text: &str) {
+        if let Some(why) = &self.nodes[i].nuked {
+            panic!("node {i} is dead: {why} (t+{} min)", (self.now - T0) / MIN);
+        }
         self.nodes[i].r.send_text(text).unwrap();
     }
 
@@ -338,6 +354,7 @@ fn equivocating_host_is_caught_by_members() {
         members: s[0].members.clone(),
         room_key: s[0].room_key.clone(),
         epoch: s[0].epoch,
+        start_hour: s[0].start_hour,
         ip_head: s[0].ip_head,
         kill_mode: s[0].kill_mode,
         grace_ms: s[0].grace_ms,
@@ -402,4 +419,79 @@ fn packets_from_other_rooms_are_ignored() {
     b.run(MIN);
     b.assert_alive();
     assert!(b.texts(1).is_empty());
+}
+
+#[test]
+fn every_packet_is_one_of_four_sizes() {
+    let mut air = Air::new(Opts { n: 4, grace: 8 * MIN, loss: 0.1, ..Opts::default() });
+    for (i, t) in ["a", "a slightly longer message", &"x".repeat(70), &"y".repeat(MAX_TEXT)].iter().enumerate() {
+        air.say(i % 4, t);
+    }
+    air.run(2 * MIN);
+    air.nodes[3].alive = false; // forces REMOVE + REKEY
+    air.run(10 * MIN);
+    air.nodes[0].r.shutdown("done", air.now); // and a NUKE
+    air.run(MIN);
+    let mut seen = std::collections::BTreeSet::new();
+    for (_, p) in &air.log {
+        assert!(commx_radio::packet::SIZES.contains(&p.len()), "odd size {}", p.len());
+        seen.insert(p.len());
+    }
+    assert!(seen.len() >= 3, "{seen:?}");
+}
+
+#[test]
+fn rooms_ride_through_hour_boundaries_and_clock_skew() {
+    // ana's clock runs 25 minutes fast, bo's 20 slow.
+    let skew = vec![0, 25 * MIN as i64, -(20 * MIN as i64)];
+    let mut air = Air::new(Opts { grace: 20 * MIN, skew, ..Opts::default() });
+    for k in 0..8 {
+        air.say(k % 3, &format!("hour {k}"));
+        air.run(30 * MIN);
+    }
+    air.assert_alive();
+    for i in 0..3 {
+        assert_eq!(air.texts(i).len(), 8, "node {i}: {:?}", air.texts(i));
+        assert_eq!(air.nodes[i].r.seq(), 8);
+    }
+}
+
+#[test]
+fn recorded_traffic_is_unreadable_hours_later() {
+    // A stolen node's keys don't open old traffic: hour keys are ratcheted
+    // forward and erased.
+    let mut air = Air::new(Opts::default());
+    // ana says something nobody hears, so no one keeps the plaintext.
+    for j in 0..3 {
+        air.hears[1][j] = false;
+    }
+    air.say(1, "said into the void");
+    air.run(MIN);
+    let (_, secret) = air.log.iter().find(|(i, _)| *i == 1).cloned().unwrap();
+    air.run(15 * MIN);
+    for j in 0..3 {
+        air.hears[1][j] = true;
+    }
+    air.run(3 * 60 * MIN);
+    air.assert_alive();
+    let before = air.texts(2).len();
+    air.nodes[2].r.on_packet(&secret, air.now);
+    air.step(500);
+    assert_eq!(air.texts(2).len(), before, "bo opened a three-hour-old packet");
+    assert!(!air.texts(2).iter().any(|t| t.contains("void")));
+}
+
+#[test]
+fn recorded_traffic_is_readable_within_the_hour() {
+    // The control for the test above: same packet, fed back promptly.
+    let mut air = Air::new(Opts::default());
+    for j in 0..3 {
+        air.hears[1][j] = false;
+    }
+    air.say(1, "said into the void");
+    air.run(MIN);
+    let (_, secret) = air.log.iter().find(|(i, _)| *i == 1).cloned().unwrap();
+    air.nodes[2].r.on_packet(&secret, air.now);
+    air.step(500);
+    assert!(air.texts(2).iter().any(|t| t.contains("void")));
 }

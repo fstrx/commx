@@ -14,6 +14,7 @@ use commx_core::text::clean;
 use commx_core::wire::{radio_go_bytes, WireMsg};
 use commx_core::{room_id_hex, RoomId};
 use commx_radio::link::{self, LinkSpec};
+use commx_radio::packet::unix_hour;
 use commx_radio::{Event, LoRa, Member, Radio, Setup, MAX_TEXT};
 use tokio::sync::mpsc;
 
@@ -89,35 +90,43 @@ impl Daemon {
             bail!("radio rooms hold at most 255 members");
         }
         let head = room.chain.head;
-        let sig = room.me.sign(&radio_go_bytes(room_id, &head, grace));
-        room.send_all(&WireMsg::RadioGo { room_id: *room_id, head, grace_secs: grace, sig });
-        self.enter_radio(room_id, grace)
+        let hour = unix_hour(unix_ms());
+        let sig = room.me.sign(&radio_go_bytes(room_id, &head, grace, hour));
+        room.send_all(&WireMsg::RadioGo { room_id: *room_id, head, grace_secs: grace, hour, sig });
+        self.enter_radio(room_id, grace, hour)
     }
 
     /// Member: the host says the room continues on radio.
-    pub fn radio_go(&mut self, room_id: &RoomId, head: [u8; 32], grace: u64, sig: &[u8]) {
+    pub fn radio_go(&mut self, room_id: &RoomId, head: [u8; 32], grace: u64, hour: u32, sig: &[u8]) {
         let Some(room) = self.rooms.get(room_id) else { return };
         if room.is_host() || room.radio.is_some() {
             return;
         }
-        if !verify(&room.chain.host_pk, &radio_go_bytes(room_id, &head, grace), sig) {
+        if !verify(&room.chain.host_pk, &radio_go_bytes(room_id, &head, grace, hour), sig) {
             return;
         }
+        let ours = unix_hour(unix_ms());
         let problem = if head != room.chain.head {
             Some("the host's chain doesn't match ours at the radio handover".to_string())
         } else if self.radio.is_none() {
             Some("the host moved the room to radio, and this node has no radio (--radio)".to_string())
         } else if self.rooms.values().any(|r| r.radio.is_some()) {
             Some("the host moved the room to radio, but this node's radio is busy with another room".to_string())
+        } else if ours.abs_diff(hour) > 1 {
+            // Radio keys change every hour; more skew than that and we'd
+            // never hear each other.
+            Some("the host moved the room to radio, but our clocks differ by over an hour".to_string())
         } else {
-            self.enter_radio(room_id, grace.max(MIN_RADIO_GRACE)).err().map(|e| format!("couldn't move to radio: {e}"))
+            self.enter_radio(room_id, grace.max(MIN_RADIO_GRACE), hour)
+                .err()
+                .map(|e| format!("couldn't move to radio: {e}"))
         };
         if let Some(reason) = problem {
             self.nuke(room_id, &reason, true);
         }
     }
 
-    fn enter_radio(&mut self, room_id: &RoomId, grace: u64) -> Result<()> {
+    fn enter_radio(&mut self, room_id: &RoomId, grace: u64, hour: u32) -> Result<()> {
         let hw = self.radio.as_ref().ok_or_else(|| anyhow!("no radio"))?;
         let (lora, budget) = (hw.lora, hw.budget);
         let ev = self.events.clone();
@@ -129,6 +138,7 @@ impl Daemon {
             members: room.members.iter().map(|m| Member { name: m.name.clone(), id: m.id }).collect(),
             room_key: Locked::from_bytes(key.as_bytes()),
             epoch: room.epoch,
+            start_hour: hour,
             ip_head: room.chain.head,
             kill_mode: room.cfg.kill_mode,
             grace_ms: grace * 1000,
@@ -136,6 +146,10 @@ impl Daemon {
             budget,
         };
         let radio = Radio::new(setup, unix_ms())?;
+        // The radio ratchets its own keys from here; holding the IP room key
+        // would undo that forward secrecy, so it goes now.
+        room.keys.clear();
+        room.pw_invite = None;
         // Radio carries text only: calls and files end here.
         let had_call = room.call.take().is_some();
         room.files.clear();

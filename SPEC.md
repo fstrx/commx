@@ -170,9 +170,17 @@ and no prologue (OPEN-8), using each side's node key as static key:
 ```
 
 After the handshake, each frame carries one Noise transport message. Its
-plaintext is `postcard(WireMsg)` (§8). The Noise nonce counts frames in each
-direction from 0. A plaintext MUST NOT exceed 65519 bytes (65535 minus the
-16-byte tag).
+plaintext is `postcard(WireMsg)` (§8), followed by zero padding. The Noise
+nonce counts frames in each direction from 0. A plaintext MUST NOT exceed
+65519 bytes (65535 minus the 16-byte tag).
+
+**Padding.** Senders SHOULD zero-pad each plaintext to `padded_len(n)`: 256
+bytes if `n ≤ 256`, the next power of two up to 4096, then the next multiple
+of 4096, capped at 65519. Someone watching the link (a mesh neighbour, the
+LAN, an ISP, a Tor guard) then sees a handful of frame sizes instead of each
+message's length: a heartbeat, a short message and a voice frame all look
+alike. Receivers decode the `WireMsg` and ignore whatever follows it, so
+padded and unpadded peers interoperate. Timing and volume still show.
 
 The node keys authenticate nothing about who is behind them. Identity comes
 from **channel binding**: aliases sign the handshake hash `h`.
@@ -236,7 +244,7 @@ fingerprint is shown next to the invite, to be compared out of band.
 | 11 | `JoinHello` | M→H | `room_id`, `token: [16]` |
 | 12 | `HostProof` | H→M | `host: MemberInfo`, `sig` |
 | 13 | `JoinReqPw` | M→H | `room_id`, `token: [16]`, `member: MemberInfo`, `sig`, `proof: [32]` |
-| 14 | `RadioGo` | H→M | `room_id`, `head: [32]`, `grace_secs: u64`, `sig` (§18.2) |
+| 14 | `RadioGo` | H→M | `room_id`, `head: [32]`, `grace_secs: u64`, `hour: u32`, `sig` (§18.2) |
 
 Signatures (`sig`, `host_sig`) are `Vec<u8>` holding 64 bytes. A node MUST
 ignore messages that make no sense for the peer's role (for example a
@@ -603,6 +611,9 @@ What the protocol does **not** provide:
 
 - **Metadata privacy from the host.** It sees who is in the room, who sends
   what and when, sizes, and who is in a call.
+- **Traffic-analysis resistance on the network.** Padding (§7.1) hides
+  exact sizes, but who talks to whom (outside Tor), when and how much still
+  show.
 - **Censorship resistance against the host.** It can drop submissions
   (OPEN-1) and equivocate (OPEN-2).
 - **Deletion by a modified client.** The kill switch is cooperative.
@@ -688,15 +699,17 @@ header, CRC on, 8-symbol preamble):
   is together. Joining over the air is out of scope for now, and so is
   joining a room that is already on radio.
 - **Handover.** The host sends every member
-  `RadioGo { room_id, head, grace_secs, sig }` over IP, where `head` is its
-  IP chain head and `sig` signs
-  `"commx-radio-go-v1:" || room_id || head || BE64(grace_secs)`. It then
-  drops its IP peers. A member that verifies the signature MUST check `head`
-  against its own chain head and nuke on mismatch, or nuke if it has no
-  radio. Otherwise it switches over. From then on IP connections are ignored
-  and losing them is not a drop. The radio chain starts from
-  `head_0 = BLAKE3("commx-radio-start-v1" || room_id || head)`. Calls and
-  files end at the handover.
+  `RadioGo { room_id, head, grace_secs, hour, sig }` over IP, where `head`
+  is its IP chain head, `hour` its current unix hour, and `sig` signs
+  `"commx-radio-go-v1:" || room_id || head || BE64(grace_secs) || BE32(hour)`.
+  It then drops its IP peers. A member that verifies the signature MUST check
+  `head` against its own chain head and nuke on mismatch; it also nukes if it
+  has no radio, or if its clock is more than an hour from `hour`. Otherwise
+  it switches over. From then on IP connections are ignored and losing them
+  is not a drop. The radio chain starts from
+  `head_0 = BLAKE3("commx-radio-start-v1" || room_id || head)`. Every node
+  derives its radio key chain (§18.3) and then wipes the IP room keys. Calls,
+  files and invites end at the handover.
 - **Broadcast.** Every packet is one broadcast transmission. The author sends
   a message once, and everyone in range hears it directly. The host does not
   repeat messages. Instead it periodically broadcasts a small signed `ORDER`
@@ -714,20 +727,35 @@ header, CRC on, 8-symbol preamble):
 ### 18.3 Packet format
 
 ```
-radio_key[e] = BLAKE3_derive_key("commx radio key v1", room_key[e])
-hp_key[e]    = BLAKE3_derive_key("commx radio hp v1",  room_key[e])
-tag          = BLAKE3_keyed(radio_key[e], "tag" || BE32(unix_hour))[0..4]
+C[e, h0]    = BLAKE3_derive_key("commx radio chain v1", room_key[e] || BE32(h0))   ; at handover
+C[e, h+1]   = BLAKE3_derive_key("commx radio ratchet v1", C[e, h])
+radio_key   = BLAKE3_derive_key("commx radio key v1", C[e, h])
+hp_key      = BLAKE3_derive_key("commx radio hp v1",  C[e, h])
+tag         = BLAKE3_keyed(radio_key, "tag" || BE32(h))[0..4]
 
-packet = tag(4) || header(12) XOR mask || AEAD(radio_key[e], nonce, body, aad = tag || header)
+packet = tag(4) || header(12) XOR mask || AEAD(radio_key, nonce, body || padding, aad = tag || header)
 header = type(1) || sender(1) || ctr(BE24) || epoch(1, low byte) || seen_seq(BE16) || seen_head(4)
 nonce  = BLAKE3_derive_key("commx radio nonce v1", BE32(epoch) || sender || ctr)[0..24]
-mask   = BLAKE3_keyed(hp_key[e], ciphertext[0..16])[0..12]
+mask   = BLAKE3_keyed(hp_key, ciphertext[0..16])[0..12]
 ```
 
 - **Fixed overhead:** 32 bytes per packet (4 tag + 12 header + 16 AEAD tag).
-- **Tag.** Lets a receiver drop other rooms' traffic cheaply, and rotates
-  hourly so the room isn't trivially linkable over time. Receivers try the
-  current, previous and next hour.
+- **Hourly ratchet (forward secrecy).** Keys change every unix hour `h`
+  along a one-way chain. A node holds `C[e, h]` for its current hour plus
+  packet keys for `h − 1` and `h + 1`, and erases everything older. Someone
+  who later takes a node's memory can read at most the last hour or two of
+  recorded traffic, not the whole session. A node's hour only moves forward,
+  starting at the handover's `h0`; clocks may disagree by up to an hour.
+  `REKEY` hands members a fresh random chain key for the new epoch, never one
+  derived from the old.
+- **Size classes.** Every packet is zero-padded inside the AEAD to 64, 128,
+  176 or 230 bytes. A `MSG` pads its text (inside the signature) instead, so
+  its signature stays last. Receivers parse each type's fixed structure and
+  require everything after it to be zero. A beat, a short message and an
+  empty `ORDER` can't be told apart by length.
+- **Tag.** Lets a receiver drop other rooms' traffic cheaply, and changes
+  hourly with the keys, so the room isn't trivially linkable over time.
+  Receivers try the previous, current and next hour.
 - **Header protection.** The header is masked as in QUIC (RFC 9001 §5.4), so
   outsiders see neither the packet type nor the sender, counter or sizes of
   fields. A receiver unmasks the header using the first 16 ciphertext bytes,
@@ -752,7 +780,7 @@ mask   = BLAKE3_keyed(hp_key[e], ciphertext[0..16])[0..12]
 | `REPAIR` (3) | any member | `n(1) || n × (sender(1) || epoch(1) || ctr(BE24)) || mac(8)` | pairwise key |
 | `JOIN` (4) | host | reserved for over-the-air joins (§18.8); ignored | — |
 | `REMOVE` (5) | host | `index(1) || sig(64)` | host signature |
-| `REKEY` (6) | host | `new_epoch(1) || n × (index(1) || AEAD(pair_key, new_key) (48)) || sig(64)`, sealed under the *previous* epoch | host signature |
+| `REKEY` (6) | host | `new_epoch(1) || n(1) || hour(BE32) || n × (index(1) || AEAD(pair_key, C[new, hour]) (48)) || sig(64)`, sealed under the *previous* epoch | host signature |
 | `NUKE` (7) | host | `sig(64)` | host signature |
 
 Signatures go inside the encrypted body, so an outsider who knows a member's
@@ -768,14 +796,15 @@ zeros.
 
 **Sizes.** An `ORDER` entry is 13 bytes, so one `ORDER` sequences up to 10
 messages (32 + 4 + 130 + 64 = 230). A `REPAIR` asks for up to 37 packets.
-A `REKEY` carries 2 members (32 + 1 + 98 + 64 = 195); 3 would not fit.
+A `REKEY` carries 2 members (32 + 6 + 98 + 64 = 200); 3 would not fit.
 Entry `epoch` bytes are the low byte of the epoch, resolved against the
 two epochs a node holds.
 
 **Re-key AEAD.** XChaCha20-Poly1305 under `pair_key`, with
-`nonce = BLAKE3_derive_key("commx radio rekey nonce v1", BE32(new_epoch) || index)[0..24]`
-and `aad = room_id || BE32(new_epoch) || index`. The nonce repeats only when
-the same key is resent to the same member, with the same plaintext.
+`nonce = BLAKE3_derive_key("commx radio rekey nonce v1", BE32(new_epoch) || BE32(hour) || index)[0..24]`
+and `aad = room_id || BE32(new_epoch) || BE32(hour) || index`. A resend in a
+later hour carries a later chain key under a new nonce; the nonce repeats
+only for the same key, to the same member, in the same hour.
 
 `hash` in an `ORDER` entry is `BLAKE3(packet)[0..8]` of the referenced packet
 as received. `MAC`s are `BLAKE3_keyed(pair_key, header || body-without-mac)[0..8]`.
@@ -828,6 +857,10 @@ as received. `MAC`s are `BLAKE3_keyed(pair_key, header || body-without-mac)[0..8
     window is still accepted if it is a listed message the node is missing,
     or the `ORDER` the chain needs next. Such packets never count as proof
     of life.
+  - The ratchet bounds repair: a packet sealed more than about an hour ago
+    can't be opened any more. Missing messages stop being asked for after
+    90 minutes, and a member whose chain has been behind for 60 minutes
+    nukes the room locally ("fell too far behind").
   - Repairs count against the airtime budget like anything else.
   - Repair also covers members who can hear the host but not each other.
 - **Retries.** An author rebroadcasts its own unconfirmed `MSG` after
@@ -861,8 +894,9 @@ two epochs' keys. One removal is in flight at a time.
 The host's `NUKE` is sent twice, outside the airtime budget: it is the last
 thing the room ever sends.
 
-Rough airtime at SF9 for a member: beats every 3⅓ minutes cost about 5 s
-per hour, leaving roughly 27 full messages per hour under a 1% duty cycle.
+Rough airtime at SF9 for a member: 64-byte beats every 3⅓ minutes cost
+about 7 s per hour, leaving roughly 25 full messages per hour under a 1%
+duty cycle.
 The host also spends airtime on `ORDER` packets and repairs, so it SHOULD
 be the node with the best antenna and the most generous budget. Nodes keep
 a sliding one-hour window of airtime used and never exceed their budget
@@ -888,5 +922,8 @@ packets". Planned adapters:
   guarantees.
 - **Compression:** a short-text compressor such as smaz or Unishox, which
   typically saves 30–50% on short English text.
-- **Forward secrecy:** a hash ratchet per epoch (OPEN-5) costs nothing on the
-  air and should come with this profile from the start.
+- **Finer forward secrecy:** the hourly ratchet (§18.3) could step faster,
+  at the cost of tolerating less clock skew.
+- **Sending times.** Packets go out when people type, so timing still says
+  when someone is active. Delaying sends to a slotted schedule would hide
+  that, at a latency cost.

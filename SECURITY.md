@@ -5,7 +5,7 @@ commx is unaudited by third parties. This file records the internal review and t
 ## Threat model
 
 **In scope:**
-- **Network observers.** They can't see content. With Tor they can't see who talks to whom.
+- **Network observers.** They can't see content, and frames are padded to a few sizes so message lengths don't show. With Tor they can't see who talks to whom. Timing and volume still show.
 - **Non-member peers.** They can't join without an invite and can't read or inject anything.
 - **A malicious member.** They can't forge others' messages, can't make the host accept undecryptable data, and can't flood the room.
 - **A malicious host.** The host can't forge, reorder or drop messages without members detecting it and nuking the room.
@@ -18,6 +18,15 @@ commx is unaudited by third parties. This file records the internal review and t
 - **Root or kernel compromise.**
 - **The host learning room metadata.** The host sees who is in the room and when people talk. It can read messages too, as a member.
 - **Size-bucket leakage.** Blob padding hides exact file sizes, not the size bucket.
+
+## Radio profile (experimental)
+
+`--radio` rooms (SPEC §18) are a prototype. The RNode adapter hasn't been tested on hardware, and the profile hasn't been reviewed outside this project.
+
+- **On the air:** content, sender, packet type and counters are encrypted or masked, and every packet is one of four sizes. Keys ratchet hourly and old ones are erased, so a radio seized later can't read traffic from more than an hour or two before.
+- **Location and timing:** any transmitter can be direction-found, and packets go out when people type.
+- **Any member can end the room**, by sending a signed packet that claims a chain the others don't have. That's detection working as designed (it is how an equivocating host is caught), but it means a hostile member is a denial of service, as with `any-member` rooms on IP.
+- **Legal:** only for licence-free bands. Amateur bands forbid encryption.
 
 ## Internal audit (October 2026)
 
